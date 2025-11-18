@@ -219,7 +219,7 @@ TrajectoryResult generateTrajectory(float t, float duration) {
 }
 
 int main(int argc, char* argv[]) {
-    const std::string inputFile = "sample_music.wav";
+    const std::string inputFile = "beep_1.wav";
     const std::string outputFile = "output_binaural.wav";
     
     // Parse command-line arguments

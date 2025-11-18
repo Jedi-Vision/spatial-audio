@@ -8,22 +8,31 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
 
 using json = nlohmann::json;
 
 // Constants
-const int MAX_SIMULTANEOUS_OBJECTS = 10;
-const int SAMPLE_RATE = 44100;
-const int FRAME_SIZE = 1024;
-const float VIDEO_FPS = 30.0f;
-const float FRAME_INTERVAL_MS = 1000.0f / VIDEO_FPS; // 33.33ms
-const float CAMERA_FOV_HORIZONTAL_DEG = 60.0f;
-const float CAMERA_FOV_VERTICAL_DEG = 45.0f;
-const float FADE_IN_TIME_MS = 100.0f;
-const float FADE_OUT_TIME_MS = 100.0f;
-const float PULSE_RATE_HZ = 2.0f;
-const float BASE_FREQUENCY_HZ = 400.0f;
-const float FREQUENCY_STEP_HZ = 100.0f;
+constexpr int MAX_SIMULTANEOUS_OBJECTS = 2;
+constexpr int SAMPLE_RATE = 48000;
+constexpr int FRAME_SIZE = 1024;
+constexpr float VIDEO_FPS = 30.0f;
+constexpr float FRAME_INTERVAL_MS = 1000.0f / VIDEO_FPS; // 33.33ms
+constexpr float CAMERA_FOV_HORIZONTAL_DEG = 60.0f;
+constexpr float CAMERA_FOV_VERTICAL_DEG = 45.0f;
+constexpr float FADE_IN_TIME_MS = 100.0f;
+constexpr float FADE_OUT_TIME_MS = 100.0f;
+constexpr float PULSE_RATE_HZ = 2.0f;
+constexpr float BASE_FREQUENCY_HZ = 400.0f;
+constexpr float FREQUENCY_STEP_HZ = 100.0f;
+
+constexpr const char* DEFAULT_DETECTION_FILE = "sample_detections.json";
+constexpr const char* DEFAULT_OUTPUT_FILE = "output_spatial_objects.wav";
+constexpr const char* DEFAULT_HRTF_SOFA = "D2_HRIR_SOFA/D2_44K_16bit_256tap_FIR_SOFA.sofa";
+const IPLVector3 LISTENER_POSITION = {0.0f, 0.0f, 0.0f};
 
 // WAV file header structures
 struct WAVHeader {
@@ -48,6 +57,100 @@ struct WAVFile {
     uint16_t bitsPerSample;
     std::vector<float> samples; // Mono samples as 32-bit float
 };
+
+struct CLIOptions {
+    std::string detectionsPath = std::string(DEFAULT_DETECTION_FILE);
+    std::string outputPath = std::string(DEFAULT_OUTPUT_FILE);
+    bool useDefaultHRTF = true;
+    bool showHelp = false;
+};
+
+struct ObjectAudioConfig {
+    int objectId;
+    std::string filePath;
+};
+
+struct SteamAudioResources {
+    IPLContext context = nullptr;
+    IPLHRTF hrtf = nullptr;
+    IPLAudioSettings audioSettings{};
+    IPLDistanceAttenuationModel distanceModel{};
+    IPLAirAbsorptionModel airAbsorptionModel{};
+    std::vector<IPLBinauralEffect> binauralEffects;
+    std::vector<IPLDirectEffect> directEffects;
+    IPLAudioBuffer inputBuffer{};
+    IPLAudioBuffer outputBuffer{};
+    IPLAudioBuffer mixBuffer{};
+
+    ~SteamAudioResources() {
+        release();
+    }
+
+    void release();
+};
+
+void freeBuffer(IPLContext context, IPLAudioBuffer& buffer) {
+    if (context != nullptr && buffer.data != nullptr) {
+        iplAudioBufferFree(context, &buffer);
+    }
+    buffer.data = nullptr;
+    buffer.numChannels = 0;
+    buffer.numSamples = 0;
+}
+
+void SteamAudioResources::release() {
+    freeBuffer(context, inputBuffer);
+    freeBuffer(context, outputBuffer);
+    freeBuffer(context, mixBuffer);
+
+    for (auto& effect : directEffects) {
+        if (effect != nullptr) {
+            iplDirectEffectRelease(&effect);
+        }
+    }
+    directEffects.clear();
+
+    for (auto& effect : binauralEffects) {
+        if (effect != nullptr) {
+            iplBinauralEffectRelease(&effect);
+        }
+    }
+    binauralEffects.clear();
+
+    if (hrtf != nullptr) {
+        iplHRTFRelease(&hrtf);
+        hrtf = nullptr;
+    }
+
+    if (context != nullptr) {
+        iplContextRelease(&context);
+        context = nullptr;
+    }
+}
+
+void zeroBuffer(IPLAudioBuffer& buffer) {
+    if (buffer.data == nullptr) {
+        return;
+    }
+
+    for (int channel = 0; channel < buffer.numChannels; ++channel) {
+        std::fill(buffer.data[channel], buffer.data[channel] + buffer.numSamples, 0.0f);
+    }
+}
+
+bool allocateBuffer(IPLContext context, int channels, int numSamples, IPLAudioBuffer& buffer, const std::string& bufferName) {
+    buffer.numChannels = channels;
+    buffer.numSamples = numSamples;
+    buffer.data = nullptr;
+
+    IPLerror error = iplAudioBufferAllocate(context, channels, numSamples, &buffer);
+    if (error != IPL_STATUS_SUCCESS || buffer.data == nullptr) {
+        std::cerr << fmt::format("Error: Failed to allocate {} buffer\n", bufferName);
+        return false;
+    }
+
+    return true;
+}
 
 // Read WAV file
 bool readWAV(const std::string& filename, WAVFile& wav) {
@@ -124,30 +227,118 @@ bool readWAV(const std::string& filename, WAVFile& wav) {
     }
 
     // Read audio data
-    size_t numSamples = header.dataSize / (header.bitsPerSample / 8) / header.numChannels;
-    std::vector<int16_t> rawSamples(numSamples * header.numChannels);
-    file.read(reinterpret_cast<char*>(rawSamples.data()), header.dataSize);
-
-    // Convert to mono float32
-    wav.samples.resize(numSamples);
-    const float scale = 1.0f / 32768.0f;
+    const int bytesPerSample = header.bitsPerSample / 8;
+    if (bytesPerSample <= 0) {
+        std::cerr << fmt::format("Error: Unsupported bits per sample: {}\n", header.bitsPerSample);
+        return false;
+    }
     
-    if (header.numChannels == 1) {
-        for (size_t i = 0; i < numSamples; i++) {
-            wav.samples[i] = rawSamples[i] * scale;
+    size_t numSamples = header.dataSize / (bytesPerSample * header.numChannels);
+    std::vector<uint8_t> rawData(header.dataSize);
+    file.read(reinterpret_cast<char*>(rawData.data()), rawData.size());
+    
+    if (static_cast<size_t>(file.gcount()) != rawData.size()) {
+        std::cerr << "Error: Failed to read WAV data chunk" << std::endl;
+        return false;
+    }
+    
+    auto sampleToFloat = [&](const uint8_t* ptr) -> float {
+        switch (header.bitsPerSample) {
+            case 8: {
+                int32_t value = static_cast<int32_t>(*ptr) - 128; // unsigned 8-bit PCM
+                return static_cast<float>(value) / 128.0f;
+            }
+            case 16: {
+                int32_t value = ptr[0] | (ptr[1] << 8);
+                if (value & 0x8000) {
+                    value |= ~0xFFFF;
+                }
+                return static_cast<float>(value) / 32768.0f;
+            }
+            case 24: {
+                int32_t value = ptr[0] | (ptr[1] << 8) | (ptr[2] << 16);
+                if (value & 0x800000) {
+                    value |= ~0xFFFFFF;
+                }
+                return static_cast<float>(value) / 8388608.0f;
+            }
+            case 32: {
+                int32_t value = ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24);
+                return static_cast<float>(value) / 2147483648.0f;
+            }
+            default:
+                std::cerr << fmt::format("Error: Unsupported bits per sample: {}\n", header.bitsPerSample);
+                return 0.0f;
         }
-    } else {
-        // Downmix stereo to mono
-        for (size_t i = 0; i < numSamples; i++) {
-            float left = rawSamples[i * header.numChannels] * scale;
-            float right = rawSamples[i * header.numChannels + 1] * scale;
-            wav.samples[i] = (left + right) * 0.5f;
+    };
+    
+    // Convert to mono float32 (downmix if needed)
+    wav.samples.resize(numSamples);
+    
+    for (size_t i = 0; i < numSamples; i++) {
+        float mixedSample = 0.0f;
+        for (uint16_t channel = 0; channel < header.numChannels; channel++) {
+            size_t offset = (i * header.numChannels + channel) * bytesPerSample;
+            mixedSample += sampleToFloat(&rawData[offset]);
         }
+        wav.samples[i] = mixedSample / static_cast<float>(header.numChannels);
     }
 
     file.close();
     std::cout << fmt::format("Loaded WAV: {} Hz, {} channels, {} samples\n", 
                              wav.sampleRate, header.numChannels, numSamples);
+    return true;
+}
+
+void printUsage(const char* executableName) {
+    std::cout << "Usage: " << executableName << " [INPUT_JSON] [OUTPUT_WAV] [OPTIONS]\n";
+    std::cout << "Options:\n";
+    std::cout << "  --hrtf <default|custom>     Use default or custom HRTF (default: default)\n";
+    std::cout << "  --help, -h                  Show this help message\n";
+}
+
+CLIOptions parseCommandLine(int argc, char* argv[]) {
+    CLIOptions options;
+
+    if (argc > 1) {
+        options.detectionsPath = argv[1];
+    }
+    if (argc > 2) {
+        options.outputPath = argv[2];
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        std::string_view arg(argv[i]);
+        if (arg == "--hrtf" && i + 1 < argc) {
+            std::string_view hrtfType(argv[++i]);
+            options.useDefaultHRTF = (hrtfType == "default");
+        } else if (arg == "--help" || arg == "-h") {
+            options.showHelp = true;
+        }
+    }
+
+    return options;
+}
+
+bool loadObjectAudio(const std::vector<ObjectAudioConfig>& configs,
+                     std::unordered_map<int, WAVFile>& audioFiles) {
+    for (const auto& config : configs) {
+        std::cout << fmt::format("Loading audio file for object ID {}: {}\n",
+                                 config.objectId, config.filePath);
+        WAVFile audioWav;
+        if (!readWAV(config.filePath, audioWav)) {
+            std::cerr << fmt::format(
+                "Error: Failed to load audio file for object ID {}: {}\n",
+                config.objectId, config.filePath);
+            return false;
+        }
+        std::cout << fmt::format("  Object ID {}: {} samples, {} Hz\n",
+                                 config.objectId, audioWav.samples.size(),
+                                 audioWav.sampleRate);
+        audioFiles[config.objectId] = std::move(audioWav);
+    }
+
+    std::cout << fmt::format("Loaded audio files for {} object IDs\n", audioFiles.size());
     return true;
 }
 
@@ -483,383 +674,348 @@ bool writeWAV(const std::string& filename, const std::vector<float>& leftChannel
     return true;
 }
 
-int main(int argc, char* argv[]) {
-    const std::string inputFile = (argc > 1) ? argv[1] : "sample_detections.json";
-    const std::string outputFile = (argc > 2) ? argv[2] : "output_spatial_objects.wav";
-    const std::string audioFile = "sample_music.wav";
-    
-    // Parse command-line arguments
-    bool useDefaultHRTF = false;
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--hrtf" && i + 1 < argc) {
-            std::string hrtfType = argv[++i];
-            useDefaultHRTF = (hrtfType == "default");
-        } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: " << argv[0] << " [INPUT_JSON] [OUTPUT_WAV] [OPTIONS]" << std::endl;
-            std::cout << "Options:" << std::endl;
-            std::cout << "  --hrtf <default|custom>     Use default or custom HRTF (default: custom)" << std::endl;
-            std::cout << "  --help, -h                  Show this help message" << std::endl;
-            return 0;
+float calculateInterpolationFactor(float currentTimeMs,
+                                   size_t currentFrameIdx,
+                                   const std::vector<DetectionFrame>& frames) {
+    if (currentFrameIdx > 0 && currentFrameIdx < frames.size()) {
+        float frameStartMs = frames[currentFrameIdx - 1].timestamp_ms;
+        float frameEndMs = frames[currentFrameIdx].timestamp_ms;
+        if (frameEndMs > frameStartMs) {
+            const float factor = (currentTimeMs - frameStartMs) / (frameEndMs - frameStartMs);
+            return std::max(0.0f, std::min(1.0f, factor));
         }
+    } else if (currentFrameIdx >= frames.size() && !frames.empty()) {
+        // After the last frame, hold the final state
+        return 1.0f;
     }
-    
-    // Load audio files for each object ID
-    std::unordered_map<int, WAVFile> audioFiles;
-    
-    // Object ID 1 uses sample_music.wav
-    std::cout << "Loading audio file for object ID 1: sample_music.wav\n";
-    WAVFile audioWAV1;
-    if (!readWAV("sample_music.wav", audioWAV1)) {
-        std::cerr << "Error: Failed to load audio file for object ID 1: sample_music.wav" << std::endl;
-        return 1;
+
+    return 0.0f;
+}
+
+bool createHRTF(bool useDefaultHRTF, SteamAudioResources& resources) {
+    IPLHRTFSettings hrtfSettings{};
+    hrtfSettings.volume = 1.0f;
+    hrtfSettings.normType = IPL_HRTFNORMTYPE_NONE;
+
+    IPLerror error = IPL_STATUS_SUCCESS;
+    if (useDefaultHRTF) {
+        hrtfSettings.type = IPL_HRTFTYPE_DEFAULT;
+        std::cout << "Using default HRTF\n";
+        error = iplHRTFCreate(resources.context, &resources.audioSettings, &hrtfSettings, &resources.hrtf);
+    } else {
+        hrtfSettings.type = IPL_HRTFTYPE_SOFA;
+        std::string sofaFile(DEFAULT_HRTF_SOFA);
+        hrtfSettings.sofaFileName = sofaFile.c_str();
+        hrtfSettings.sofaData = nullptr;
+        hrtfSettings.sofaDataSize = 0;
+        std::cout << fmt::format("Loading HRTF from SOFA file: {}\n", sofaFile);
+        error = iplHRTFCreate(resources.context, &resources.audioSettings, &hrtfSettings, &resources.hrtf);
     }
-    audioFiles[1] = audioWAV1;
-    std::cout << fmt::format("  Object ID 1: {} samples, {} Hz\n", audioWAV1.samples.size(), audioWAV1.sampleRate);
-    
-    // Object ID 2 uses sample_music_2.wav
-    std::cout << "Loading audio file for object ID 2: sample_music_2.wav\n";
-    WAVFile audioWAV2;
-    if (!readWAV("sample_music_2.wav", audioWAV2)) {
-        std::cerr << "Error: Failed to load audio file for object ID 2: sample_music_2.wav" << std::endl;
-        return 1;
+
+    if (error != IPL_STATUS_SUCCESS) {
+        std::cerr << "Error: Failed to create HRTF\n";
+        return false;
     }
-    audioFiles[2] = audioWAV2;
-    std::cout << fmt::format("  Object ID 2: {} samples, {} Hz\n", audioWAV2.samples.size(), audioWAV2.sampleRate);
-    
-    std::cout << fmt::format("Loaded audio files for {} object IDs\n", audioFiles.size());
-    
-    // Read detection frames
-    std::vector<DetectionFrame> detection_frames;
-    if (!readDetectionFrames(inputFile, detection_frames)) {
-        return 1;
-    }
-    
-    if (detection_frames.empty()) {
-        std::cerr << "Error: No detection frames found in file" << std::endl;
-        return 1;
-    }
-    
-    // Calculate total duration
-    float total_duration_ms = detection_frames.back().timestamp_ms + FRAME_INTERVAL_MS;
-    float total_duration_sec = total_duration_ms / 1000.0f;
-    size_t total_samples = static_cast<size_t>(total_duration_sec * SAMPLE_RATE);
-    
-    std::cout << fmt::format("Processing {} frames ({:.2f} seconds, {} samples)\n",
-                            detection_frames.size(), total_duration_sec, total_samples);
-    
-    // Initialize Steam Audio context
-    IPLContext context = nullptr;
+
+    std::cout << (useDefaultHRTF ? "Default HRTF created\n" : "Custom HRTF created from SOFA file\n");
+    return true;
+}
+
+bool initializeSteamAudioResources(bool useDefaultHRTF, SteamAudioResources& resources) {
+    resources.release();
+
     IPLContextSettings contextSettings{};
     contextSettings.version = STEAMAUDIO_VERSION;
-    contextSettings.simdLevel = IPL_SIMDLEVEL_NEON; // Use NEON on ARM64
-    
-    IPLerror error = iplContextCreate(&contextSettings, &context);
+    contextSettings.simdLevel = IPL_SIMDLEVEL_NEON;
+
+    IPLerror error = iplContextCreate(&contextSettings, &resources.context);
     if (error != IPL_STATUS_SUCCESS) {
-        std::cerr << "Error: Failed to create Steam Audio context" << std::endl;
-        return 1;
+        std::cerr << "Error: Failed to create Steam Audio context\n";
+        return false;
     }
     std::cout << "Steam Audio context created\n";
 
-    // Set up audio settings
-    IPLAudioSettings audioSettings{};
-    audioSettings.samplingRate = SAMPLE_RATE;
-    audioSettings.frameSize = FRAME_SIZE;
+    resources.audioSettings.samplingRate = SAMPLE_RATE;
+    resources.audioSettings.frameSize = FRAME_SIZE;
 
-    // Create HRTF
-    IPLHRTF hrtf = nullptr;
-    IPLHRTFSettings hrtfSettings{};
-    
-    if (useDefaultHRTF) {
-        hrtfSettings.type = IPL_HRTFTYPE_DEFAULT;
-        hrtfSettings.volume = 1.0f;
-        hrtfSettings.normType = IPL_HRTFNORMTYPE_NONE;
-        
-        std::cout << "Using default HRTF\n";
-        
-        error = iplHRTFCreate(context, &audioSettings, &hrtfSettings, &hrtf);
-        if (error != IPL_STATUS_SUCCESS) {
-            std::cerr << "Error: Failed to create default HRTF" << std::endl;
-            iplContextRelease(&context);
-            return 1;
-        }
-        std::cout << "Default HRTF created\n";
-    } else {
-        hrtfSettings.type = IPL_HRTFTYPE_SOFA;
-        
-        std::string sofaFilePath = "D2_HRIR_SOFA/D2_44K_16bit_256tap_FIR_SOFA.sofa";
-        
-        hrtfSettings.sofaFileName = sofaFilePath.c_str();
-        hrtfSettings.sofaData = nullptr;
-        hrtfSettings.sofaDataSize = 0;
-        hrtfSettings.volume = 1.0f;
-        hrtfSettings.normType = IPL_HRTFNORMTYPE_NONE;
-        
-        std::cout << fmt::format("Loading HRTF from SOFA file: {}\n", sofaFilePath);
-        
-        error = iplHRTFCreate(context, &audioSettings, &hrtfSettings, &hrtf);
-        if (error != IPL_STATUS_SUCCESS) {
-            std::cerr << fmt::format("Error: Failed to create HRTF from SOFA file: {}\n", sofaFilePath) << std::endl;
-            std::cerr << "Make sure the SOFA file exists and is accessible." << std::endl;
-            iplContextRelease(&context);
-            return 1;
-        }
-        std::cout << "Custom HRTF created from SOFA file\n";
+    if (!createHRTF(useDefaultHRTF, resources)) {
+        resources.release();
+        return false;
     }
 
-    // Create binaural effects for each object (pool of MAX_SIMULTANEOUS_OBJECTS)
-    std::vector<IPLBinauralEffect> binaural_effects(MAX_SIMULTANEOUS_OBJECTS, nullptr);
+    resources.distanceModel = {};
+    resources.distanceModel.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
+    resources.distanceModel.minDistance = 0.0f;
+    resources.distanceModel.callback = nullptr;
+    resources.distanceModel.userData = nullptr;
+    resources.distanceModel.dirty = IPL_FALSE;
+
+    resources.airAbsorptionModel = {};
+    resources.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+    resources.airAbsorptionModel.callback = nullptr;
+    resources.airAbsorptionModel.userData = nullptr;
+    resources.airAbsorptionModel.dirty = IPL_FALSE;
+
+    if (!allocateBuffer(resources.context, 1, FRAME_SIZE, resources.inputBuffer, "input") ||
+        !allocateBuffer(resources.context, 2, FRAME_SIZE, resources.outputBuffer, "output") ||
+        !allocateBuffer(resources.context, 2, FRAME_SIZE, resources.mixBuffer, "mix")) {
+        resources.release();
+        return false;
+    }
+
+    resources.binauralEffects.assign(MAX_SIMULTANEOUS_OBJECTS, nullptr);
+    resources.directEffects.assign(MAX_SIMULTANEOUS_OBJECTS, nullptr);
     IPLBinauralEffectSettings effectSettings{};
-    effectSettings.hrtf = hrtf;
-    
-    for (int i = 0; i < MAX_SIMULTANEOUS_OBJECTS; i++) {
-        error = iplBinauralEffectCreate(context, &audioSettings, &effectSettings, &binaural_effects[i]);
+    effectSettings.hrtf = resources.hrtf;
+    IPLDirectEffectSettings directSettings{};
+    directSettings.numChannels = 1;
+
+    for (int i = 0; i < MAX_SIMULTANEOUS_OBJECTS; ++i) {
+        error = iplBinauralEffectCreate(resources.context,
+                                        &resources.audioSettings,
+                                        &effectSettings,
+                                        &resources.binauralEffects[i]);
         if (error != IPL_STATUS_SUCCESS) {
             std::cerr << fmt::format("Error: Failed to create binaural effect {}\n", i) << std::endl;
-            // Cleanup already created effects
-            for (int j = 0; j < i; j++) {
-                iplBinauralEffectRelease(&binaural_effects[j]);
-            }
-            iplHRTFRelease(&hrtf);
-            iplContextRelease(&context);
-            return 1;
+            resources.release();
+            return false;
         }
-    }
-    std::cout << fmt::format("Created {} binaural effects\n", MAX_SIMULTANEOUS_OBJECTS);
 
-    // Set up distance attenuation model
-    IPLDistanceAttenuationModel distanceModel{};
-    distanceModel.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
-    distanceModel.minDistance = 1.0f;
-    distanceModel.callback = nullptr;
-    distanceModel.userData = nullptr;
-    distanceModel.dirty = IPL_FALSE;
-    
-    // Listener is at origin (0, 0, 0)
-    IPLVector3 listenerPosition = {0.0f, 0.0f, 0.0f};
+        error = iplDirectEffectCreate(resources.context,
+                                      &resources.audioSettings,
+                                      &directSettings,
+                                      &resources.directEffects[i]);
+        if (error != IPL_STATUS_SUCCESS) {
+            std::cerr << fmt::format("Error: Failed to create direct effect {}\n", i) << std::endl;
+            resources.release();
+            return false;
+        }
+    }
 
-    // Allocate audio buffers
-    IPLAudioBuffer inputBuffer{};
-    IPLAudioBuffer outputBuffer{};
-    IPLAudioBuffer mixBuffer{};
-    
-    inputBuffer.numChannels = 1; // Mono input
-    inputBuffer.numSamples = FRAME_SIZE;
-    error = iplAudioBufferAllocate(context, 1, FRAME_SIZE, &inputBuffer);
-    if (error != IPL_STATUS_SUCCESS || inputBuffer.data == nullptr) {
-        std::cerr << "Error: Failed to allocate input buffer" << std::endl;
-        for (auto& effect : binaural_effects) {
-            iplBinauralEffectRelease(&effect);
-        }
-        iplHRTFRelease(&hrtf);
-        iplContextRelease(&context);
-        return 1;
+    std::cout << fmt::format("Created {} binaural and direct effects\n", MAX_SIMULTANEOUS_OBJECTS);
+    return true;
+}
+
+bool processSpatialAudio(const std::vector<DetectionFrame>& detectionFrames,
+                         const std::unordered_map<int, WAVFile>& audioFiles,
+                         SteamAudioResources& resources,
+                         std::vector<float>& leftOutput,
+                         std::vector<float>& rightOutput) {
+    if (detectionFrames.empty()) {
+        std::cerr << "Error: No detection frames found in file\n";
+        return false;
     }
-    
-    outputBuffer.numChannels = 2; // Stereo output
-    outputBuffer.numSamples = FRAME_SIZE;
-    error = iplAudioBufferAllocate(context, 2, FRAME_SIZE, &outputBuffer);
-    if (error != IPL_STATUS_SUCCESS || outputBuffer.data == nullptr) {
-        std::cerr << "Error: Failed to allocate output buffer" << std::endl;
-        iplAudioBufferFree(context, &inputBuffer);
-        for (auto& effect : binaural_effects) {
-            iplBinauralEffectRelease(&effect);
-        }
-        iplHRTFRelease(&hrtf);
-        iplContextRelease(&context);
-        return 1;
-    }
-    
-    mixBuffer.numChannels = 2; // Stereo mix buffer
-    mixBuffer.numSamples = FRAME_SIZE;
-    error = iplAudioBufferAllocate(context, 2, FRAME_SIZE, &mixBuffer);
-    if (error != IPL_STATUS_SUCCESS || mixBuffer.data == nullptr) {
-        std::cerr << "Error: Failed to allocate mix buffer" << std::endl;
-        iplAudioBufferFree(context, &inputBuffer);
-        iplAudioBufferFree(context, &outputBuffer);
-        for (auto& effect : binaural_effects) {
-            iplBinauralEffectRelease(&effect);
-        }
-        iplHRTFRelease(&hrtf);
-        iplContextRelease(&context);
-        return 1;
-    }
-    
-    // Initialize object tracker
+
+    const float totalDurationMs = detectionFrames.back().timestamp_ms + FRAME_INTERVAL_MS;
+    const float totalDurationSec = totalDurationMs / 1000.0f;
+    const size_t totalSamples = static_cast<size_t>(totalDurationSec * SAMPLE_RATE);
+
+    std::cout << fmt::format("Processing {} frames ({:.2f} seconds, {} samples)\n",
+                             detectionFrames.size(), totalDurationSec, totalSamples);
+
     ObjectTracker tracker;
-    
-    // Process audio
-    std::vector<float> leftOutput;
-    std::vector<float> rightOutput;
-    
-    size_t current_frame_idx = 0;
-    float current_time_sec = 0.0f;
-    float max_output_left = 0.0f;
-    float max_output_right = 0.0f;
-    
+    std::unordered_map<int, int> objectToEffectSlot;
+    int nextAvailableSlot = 0;
+
+    leftOutput.clear();
+    rightOutput.clear();
+    leftOutput.reserve(totalSamples);
+    rightOutput.reserve(totalSamples);
+
+    size_t currentFrameIdx = 0;
+    float maxOutputLeft = 0.0f;
+    float maxOutputRight = 0.0f;
+
     std::cout << "Processing audio...\n";
-    
-    for (size_t sample_offset = 0; sample_offset < total_samples; sample_offset += FRAME_SIZE) {
-        current_time_sec = static_cast<float>(sample_offset) / SAMPLE_RATE;
-        float current_time_ms = current_time_sec * 1000.0f;
-        
-        // Update tracker with latest detection frame if needed
-        while (current_frame_idx < detection_frames.size() && 
-               detection_frames[current_frame_idx].timestamp_ms <= current_time_ms) {
-            uint64_t timestamp_us = static_cast<uint64_t>(detection_frames[current_frame_idx].timestamp_ms * 1000.0f);
-            tracker.updateFromFrame(detection_frames[current_frame_idx], timestamp_us);
-            current_frame_idx++;
+    for (size_t sampleOffset = 0; sampleOffset < totalSamples; sampleOffset += FRAME_SIZE) {
+        const float currentTimeSec = static_cast<float>(sampleOffset) / SAMPLE_RATE;
+        const float currentTimeMs = currentTimeSec * 1000.0f;
+
+        while (currentFrameIdx < detectionFrames.size() &&
+               detectionFrames[currentFrameIdx].timestamp_ms <= currentTimeMs) {
+            uint64_t timestampUs = static_cast<uint64_t>(
+                detectionFrames[currentFrameIdx].timestamp_ms * 1000.0f);
+            tracker.updateFromFrame(detectionFrames[currentFrameIdx], timestampUs);
+            currentFrameIdx++;
         }
-        
-        // Calculate interpolation factor for this audio frame
-        // Interpolate between the last processed frame and the next frame
-        float interpolation_factor = 0.0f; // Default: use last processed frame
-        if (current_frame_idx > 0 && current_frame_idx < detection_frames.size()) {
-            float frame_start_ms = detection_frames[current_frame_idx - 1].timestamp_ms;
-            float frame_end_ms = detection_frames[current_frame_idx].timestamp_ms;
-            if (frame_end_ms > frame_start_ms) {
-                interpolation_factor = (current_time_ms - frame_start_ms) / (frame_end_ms - frame_start_ms);
-                interpolation_factor = std::max(0.0f, std::min(1.0f, interpolation_factor)); // Clamp to [0, 1]
-            }
-        } else if (current_frame_idx >= detection_frames.size() && detection_frames.size() > 0) {
-            // After last frame, use last frame position (no interpolation)
-            interpolation_factor = 1.0f;
-        }
-        
-        // Get interpolated positions for active objects
-        auto active_objects = tracker.getInterpolatedPositions(interpolation_factor);
-        
-        // Zero mix buffer
-        for (int i = 0; i < FRAME_SIZE; i++) {
-            mixBuffer.data[0][i] = 0.0f;
-            mixBuffer.data[1][i] = 0.0f;
-        }
-        
-        // Process each active object
-        for (size_t obj_idx = 0; obj_idx < active_objects.size() && obj_idx < MAX_SIMULTANEOUS_OBJECTS; obj_idx++) {
-            int object_id = active_objects[obj_idx].first;
-            IPLVector3 position = active_objects[obj_idx].second;
-            
-            // Calculate distance and direction
-            float distance = std::sqrt(position.x * position.x + 
-                                       position.y * position.y + 
-                                       position.z * position.z);
-            
-            if (distance < 0.001f) {
-                distance = 0.001f; // Avoid division by zero
-            }
-            
-            IPLVector3 direction;
-            direction.x = position.x / distance;
-            direction.y = position.y / distance;
-            direction.z = position.z / distance;
-            
-            // Get audio samples from the appropriate WAV file for this object
-            auto audioIt = audioFiles.find(object_id);
-            if (audioIt != audioFiles.end()) {
-                getAudioSamples(audioIt->second, inputBuffer.data[0], FRAME_SIZE, current_time_sec, SAMPLE_RATE);
+
+        const float interpolationFactor = calculateInterpolationFactor(currentTimeMs, currentFrameIdx, detectionFrames);
+        const auto activeObjects = tracker.getInterpolatedPositions(interpolationFactor);
+
+        zeroBuffer(resources.mixBuffer);
+
+        for (const auto& entry : activeObjects) {
+            const int objectId = entry.first;
+            const IPLVector3& position = entry.second;
+            int effectSlot = -1;
+            auto slotIt = objectToEffectSlot.find(objectId);
+            if (slotIt != objectToEffectSlot.end()) {
+                effectSlot = slotIt->second;
+            } else if (nextAvailableSlot < MAX_SIMULTANEOUS_OBJECTS) {
+                effectSlot = nextAvailableSlot++;
+                objectToEffectSlot[objectId] = effectSlot;
+                iplBinauralEffectReset(resources.binauralEffects[effectSlot]);
+                iplDirectEffectReset(resources.directEffects[effectSlot]);
             } else {
-                // No audio file for this object ID, output silence
-                for (int i = 0; i < FRAME_SIZE; i++) {
-                    inputBuffer.data[0][i] = 0.0f;
-                }
+                continue;
             }
-            
-            // Apply fade volume
-            float fade_vol = tracker.getFadeVolume(object_id);
-            for (int i = 0; i < FRAME_SIZE; i++) {
-                inputBuffer.data[0][i] *= fade_vol;
+
+            float distance = std::sqrt(position.x * position.x +
+                                       position.y * position.y +
+                                       position.z * position.z);
+            distance = std::max(distance, 0.001f);
+
+            IPLVector3 direction{
+                position.x / distance,
+                position.y / distance,
+                position.z / distance};
+
+            zeroBuffer(resources.inputBuffer);
+
+            auto audioIt = audioFiles.find(objectId);
+            if (audioIt != audioFiles.end()) {
+                getAudioSamples(audioIt->second,
+                                resources.inputBuffer.data[0],
+                                FRAME_SIZE,
+                                currentTimeSec,
+                                SAMPLE_RATE);
             }
-            
-            // Calculate distance attenuation
-            IPLfloat32 distanceAttenuation = iplDistanceAttenuationCalculate(
-                context, position, listenerPosition, &distanceModel);
-            
-            // Apply distance attenuation
-            for (int i = 0; i < FRAME_SIZE; i++) {
-                inputBuffer.data[0][i] *= distanceAttenuation;
+
+            const float fadeVolume = tracker.getFadeVolume(objectId);
+            for (int i = 0; i < FRAME_SIZE; ++i) {
+                resources.inputBuffer.data[0][i] *= fadeVolume;
             }
-            
-            // Zero output buffer
-            for (int i = 0; i < FRAME_SIZE; i++) {
-                outputBuffer.data[0][i] = 0.0f;
-                outputBuffer.data[1][i] = 0.0f;
+
+            const IPLfloat32 distanceAttenuation = iplDistanceAttenuationCalculate(
+                resources.context,
+                position,
+                LISTENER_POSITION,
+                &resources.distanceModel);
+            IPLfloat32 airAbsorption[IPL_NUM_BANDS] = {0.9f, 0.7f, 0.5f};
+            iplAirAbsorptionCalculate(resources.context,
+                                      position,
+                                      LISTENER_POSITION,
+                                      &resources.airAbsorptionModel,
+                                      airAbsorption);
+
+            IPLDirectEffectParams directParams{};
+            directParams.flags = static_cast<IPLDirectEffectFlags>(
+                IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+                IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
+            directParams.transmissionType = IPL_TRANSMISSIONTYPE_FREQINDEPENDENT;
+            directParams.distanceAttenuation = distanceAttenuation;
+            directParams.directivity = 1.0f;
+            directParams.occlusion = 0.0f;
+            for (int band = 0; band < IPL_NUM_BANDS; ++band) {
+                directParams.airAbsorption[band] = airAbsorption[band];
+                directParams.transmission[band] = 1.0f;
             }
-            
-            // Set up binaural effect parameters
+
+            iplDirectEffectApply(resources.directEffects[effectSlot],
+                                 &directParams,
+                                 &resources.inputBuffer,
+                                 &resources.inputBuffer);
+
+            zeroBuffer(resources.outputBuffer);
+
             IPLBinauralEffectParams params{};
             params.direction = direction;
             params.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
-            params.spatialBlend = 1.0f; // Full spatialization
-            params.hrtf = hrtf;
-            
-            // Apply binaural effect
-            iplBinauralEffectApply(binaural_effects[obj_idx], &params, &inputBuffer, &outputBuffer);
-            
-            // Mix into mix buffer
-            for (int i = 0; i < FRAME_SIZE; i++) {
-                mixBuffer.data[0][i] += outputBuffer.data[0][i];
-                mixBuffer.data[1][i] += outputBuffer.data[1][i];
+            params.spatialBlend = 1.0f;
+            params.hrtf = resources.hrtf;
+
+            iplBinauralEffectApply(resources.binauralEffects[effectSlot],
+                                   &params,
+                                   &resources.inputBuffer,
+                                   &resources.outputBuffer);
+
+            for (int i = 0; i < FRAME_SIZE; ++i) {
+                resources.mixBuffer.data[0][i] += resources.outputBuffer.data[0][i];
+                resources.mixBuffer.data[1][i] += resources.outputBuffer.data[1][i];
             }
         }
-        
-        // Collect output samples
-        size_t frame_size = std::min(static_cast<size_t>(FRAME_SIZE), total_samples - sample_offset);
-        for (size_t i = 0; i < frame_size; i++) {
-            leftOutput.push_back(mixBuffer.data[0][i]);
-            rightOutput.push_back(mixBuffer.data[1][i]);
-            max_output_left = std::max(max_output_left, std::abs(mixBuffer.data[0][i]));
-            max_output_right = std::max(max_output_right, std::abs(mixBuffer.data[1][i]));
+
+        const size_t frameSize = std::min(static_cast<size_t>(FRAME_SIZE), totalSamples - sampleOffset);
+        for (size_t i = 0; i < frameSize; ++i) {
+            leftOutput.push_back(resources.mixBuffer.data[0][i]);
+            rightOutput.push_back(resources.mixBuffer.data[1][i]);
+            maxOutputLeft = std::max(maxOutputLeft, std::abs(resources.mixBuffer.data[0][i]));
+            maxOutputRight = std::max(maxOutputRight, std::abs(resources.mixBuffer.data[1][i]));
         }
-        
-        // Progress indicator
-        if ((sample_offset / FRAME_SIZE) % 100 == 0) {
-            float progress = (static_cast<float>(sample_offset) / total_samples) * 100.0f;
+
+        if ((sampleOffset / FRAME_SIZE) % 100 == 0) {
+            const float progress = (static_cast<float>(sampleOffset) / totalSamples) * 100.0f;
             std::cout << fmt::format("Progress: {:.1f}%\r", progress);
             std::cout.flush();
         }
     }
-    
-    std::cout << fmt::format("\nOutput audio peak levels - Left: {:.4f}, Right: {:.4f}\n", 
-                            max_output_left, max_output_right);
-    
-    // Process tail samples for all effects
-    for (auto& effect : binaural_effects) {
-        IPLAudioEffectState tailState = iplBinauralEffectGetTail(effect, &outputBuffer);
+
+    std::cout << fmt::format("\nOutput audio peak levels - Left: {:.4f}, Right: {:.4f}\n",
+                             maxOutputLeft, maxOutputRight);
+
+    zeroBuffer(resources.outputBuffer);
+    for (const auto& entry : objectToEffectSlot) {
+        const int slot = entry.second;
+        IPLAudioEffectState tailState = iplBinauralEffectGetTail(
+            resources.binauralEffects[slot],
+            &resources.outputBuffer);
         while (tailState == IPL_AUDIOEFFECTSTATE_TAILREMAINING) {
-            for (int i = 0; i < FRAME_SIZE; i++) {
-                leftOutput.push_back(outputBuffer.data[0][i]);
-                rightOutput.push_back(outputBuffer.data[1][i]);
+            for (int i = 0; i < FRAME_SIZE; ++i) {
+                leftOutput.push_back(resources.outputBuffer.data[0][i]);
+                rightOutput.push_back(resources.outputBuffer.data[1][i]);
             }
-            tailState = iplBinauralEffectGetTail(effect, &outputBuffer);
+            tailState = iplBinauralEffectGetTail(resources.binauralEffects[slot],
+                                                 &resources.outputBuffer);
         }
     }
-    
+
     std::cout << "\nProcessing complete\n";
+    return true;
+}
 
-    // Free audio buffers
-    iplAudioBufferFree(context, &inputBuffer);
-    iplAudioBufferFree(context, &outputBuffer);
-    iplAudioBufferFree(context, &mixBuffer);
+int main(int argc, char* argv[]) {
+    CLIOptions options = parseCommandLine(argc, argv);
+    if (options.showHelp) {
+        printUsage(argv[0]);
+        return 0;
+    }
 
-    // Write output WAV file
-    if (!writeWAV(outputFile, leftOutput, rightOutput, SAMPLE_RATE)) {
-        for (auto& effect : binaural_effects) {
-            iplBinauralEffectRelease(&effect);
-        }
-        iplHRTFRelease(&hrtf);
-        iplContextRelease(&context);
+    std::unordered_map<int, WAVFile> audioFiles;
+    const std::vector<ObjectAudioConfig> audioConfigs = {
+        {1, "beep_1.wav"},
+        {2, "beep_2.wav"},
+    };
+
+    if (!loadObjectAudio(audioConfigs, audioFiles)) {
         return 1;
     }
 
-    // Cleanup
-    for (auto& effect : binaural_effects) {
-        iplBinauralEffectRelease(&effect);
+    std::vector<DetectionFrame> detectionFrames;
+    if (!readDetectionFrames(options.detectionsPath, detectionFrames)) {
+        return 1;
     }
-    iplHRTFRelease(&hrtf);
-    iplContextRelease(&context);
 
-    std::cout << fmt::format("Successfully created spatial audio: {}\n", outputFile);
+    if (detectionFrames.empty()) {
+        std::cerr << "Error: No detection frames found in file\n";
+        return 1;
+    }
+
+    SteamAudioResources audioResources;
+    if (!initializeSteamAudioResources(options.useDefaultHRTF, audioResources)) {
+        return 1;
+    }
+
+    std::vector<float> leftOutput;
+    std::vector<float> rightOutput;
+    if (!processSpatialAudio(detectionFrames, audioFiles, audioResources, leftOutput, rightOutput)) {
+        return 1;
+    }
+
+    if (!writeWAV(options.outputPath, leftOutput, rightOutput, SAMPLE_RATE)) {
+        return 1;
+    }
+
+    std::cout << fmt::format("Successfully created spatial audio: {}\n", options.outputPath);
     return 0;
 }
 

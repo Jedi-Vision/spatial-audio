@@ -48,6 +48,8 @@ output*.wav
 *.wav
 !sample_music.wav
 !sample_music_2.wav
+!beep_1.wav
+!beep_2.wav
 
 # Logs
 *.log

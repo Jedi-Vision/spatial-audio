@@ -63,7 +63,7 @@ Options:
 - `--export-trajectory, -e` - Export trajectory data to CSV file
 - `--help, -h` - Show help message
 
-Input: `sample_music.wav` (must be in project root)
+Input: `beep_1.wav` (must be in project root)
 Output: `output_binaural.wav`
 
 ### Object Spatial Audio
@@ -96,8 +96,8 @@ Fields:
   - `class`: Optional class name (string)
 
 **Audio File Mapping**:
-- Object ID 1 uses `sample_music.wav`
-- Object ID 2 uses `sample_music_2.wav`
+- Object ID 1 uses `beep_1.wav`
+- Object ID 2 uses `beep_2.wav`
 
 **Example**:
 ```bash
