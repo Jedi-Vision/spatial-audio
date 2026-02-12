@@ -16,7 +16,7 @@
 using json = nlohmann::json;
 
 // Constants
-constexpr int MAX_SIMULTANEOUS_OBJECTS = 2;
+constexpr int MAX_SIMULTANEOUS_OBJECTS = 4;
 constexpr int SAMPLE_RATE = 48000;
 constexpr int FRAME_SIZE = 1024;
 constexpr float VIDEO_FPS = 30.0f;
@@ -28,6 +28,16 @@ constexpr float FADE_OUT_TIME_MS = 100.0f;
 constexpr float PULSE_RATE_HZ = 2.0f;
 constexpr float BASE_FREQUENCY_HZ = 400.0f;
 constexpr float FREQUENCY_STEP_HZ = 100.0f;
+
+// Multi-object audio differentiation constants
+// Rhythmic beat pattern: each object beeps on its own beat subdivision
+constexpr float BEAT_CYCLE_MS = 2000.0f;   // Full cycle duration (slow, 30 BPM)
+constexpr float BEAT_DURATION_MS = 400.0f; // How long each beep sounds within its slot
+constexpr float SOURCE_AUDIO_LIMIT_MS = 300.0f; // Only use first N ms of source audio (prevents looping/repeats)
+// Beat offsets as fraction of cycle [0.0 - 1.0) for each object slot
+constexpr float BEAT_OFFSET[MAX_SIMULTANEOUS_OBJECTS] = {0.0f, 0.25f, 0.5f, 0.75f};
+// Musical intervals in semitones (C, E, G, B - major 7th chord)
+constexpr float PITCH_SEMITONES[MAX_SIMULTANEOUS_OBJECTS] = {0.0f, 4.0f, 7.0f, 11.0f};
 
 constexpr const char* DEFAULT_DETECTION_FILE = "sample_detections.json";
 constexpr const char* DEFAULT_OUTPUT_FILE = "output_spatial_objects.wav";
@@ -68,6 +78,26 @@ struct CLIOptions {
 struct ObjectAudioConfig {
     int objectId;
     std::string filePath;
+};
+
+// Parameters for pitch-shifted and rhythmically-gated audio playback per object slot
+struct ObjectAudioParams {
+    float pitchRatio;      // 2^(semitones/12) - playback speed multiplier
+    float beatOffset;      // Offset within beat cycle [0.0 - 1.0)
+    float beatCycleSec;    // Full beat cycle duration in seconds
+    float beatDurationSec; // Duration of the beep within its slot
+    
+    static ObjectAudioParams forSlot(int slot) {
+        ObjectAudioParams params;
+        float semitones = (slot >= 0 && slot < MAX_SIMULTANEOUS_OBJECTS) 
+                          ? PITCH_SEMITONES[slot] : 0.0f;
+        params.pitchRatio = std::pow(2.0f, semitones / 12.0f);
+        params.beatOffset = (slot >= 0 && slot < MAX_SIMULTANEOUS_OBJECTS)
+                            ? BEAT_OFFSET[slot] : 0.0f;
+        params.beatCycleSec = BEAT_CYCLE_MS / 1000.0f;
+        params.beatDurationSec = BEAT_DURATION_MS / 1000.0f;
+        return params;
+    }
 };
 
 struct SteamAudioResources {
@@ -527,10 +557,16 @@ public:
     }
 };
 
-// Get audio samples from loaded WAV file for an object
-// Handles resampling and looping if needed
+// Get audio samples from loaded WAV file for an object with rhythmic gating
+// Handles resampling, pitch shifting, and rhythmic beat patterns
+// pitch_ratio: 1.0 = original pitch, >1.0 = higher pitch, <1.0 = lower pitch
+// beat_offset: when within the beat cycle this object should play [0.0 - 1.0)
+// beat_cycle_sec: duration of the full beat cycle in seconds
+// beat_duration_sec: how long the beep sounds within its slot
 void getAudioSamples(const WAVFile& wav, float* output, int num_samples, 
-                     float start_time, float target_sample_rate) {
+                     float start_time, float target_sample_rate,
+                     float pitch_ratio = 1.0f, float beat_offset = 0.0f,
+                     float beat_cycle_sec = 0.6f, float beat_duration_sec = 0.15f) {
     if (wav.samples.empty()) {
         // No audio loaded, output silence
         for (int i = 0; i < num_samples; i++) {
@@ -549,37 +585,77 @@ void getAudioSamples(const WAVFile& wav, float* output, int num_samples,
         return;
     }
     
-    // If sample rates match, use direct indexing (no resampling needed)
-    if (std::abs(source_sample_rate - target_sample_rate) < 1.0f) {
-        size_t start_index = static_cast<size_t>(start_time * source_sample_rate) % source_size;
-        for (int i = 0; i < num_samples; i++) {
-            size_t index = (start_index + i) % source_size;
-            output[i] = wav.samples[index];
-        }
-        return;
-    }
+    // Calculate beat slot timing
+    float slot_start = beat_offset * beat_cycle_sec;
+    float slot_end = slot_start + beat_duration_sec;
     
-    // Resample from source sample rate to target sample rate
+    // Resample with pitch shifting and rhythmic gating
     for (int i = 0; i < num_samples; i++) {
-        // Calculate the time in the source audio
+        // Calculate the time in the target audio
         float target_time = start_time + (static_cast<float>(i) / target_sample_rate);
-        float source_sample_index = target_time * source_sample_rate;
         
-        // Handle wrapping for looping
-        float wrapped_index = std::fmod(source_sample_index, static_cast<float>(source_size));
-        if (wrapped_index < 0.0f) {
-            wrapped_index += source_size;
+        // Determine position within the current beat cycle
+        float cycle_position = std::fmod(target_time, beat_cycle_sec);
+        
+        // Check if we're within this object's beat slot (with wrapping)
+        bool in_slot = false;
+        if (slot_end <= beat_cycle_sec) {
+            // Normal case: slot doesn't wrap around
+            in_slot = (cycle_position >= slot_start && cycle_position < slot_end);
+        } else {
+            // Wrapped case: slot crosses cycle boundary
+            in_slot = (cycle_position >= slot_start || cycle_position < std::fmod(slot_end, beat_cycle_sec));
+        }
+        
+        if (!in_slot) {
+            output[i] = 0.0f;
+            continue;
+        }
+        
+        // Calculate time within the current beat (for envelope/playback)
+        float time_in_slot = cycle_position - slot_start;
+        if (time_in_slot < 0.0f) {
+            time_in_slot += beat_cycle_sec;
+        }
+        
+        // Calculate source sample index with pitch adjustment
+        // Use time_in_slot so each beat starts from the beginning of the sample
+        float source_sample_index = time_in_slot * source_sample_rate * pitch_ratio;
+        
+        // Limit how much of the source audio we use (prevents hearing multiple beeps if file is long)
+        float source_limit_samples = (SOURCE_AUDIO_LIMIT_MS / 1000.0f) * source_sample_rate;
+        float effective_source_size = std::min(static_cast<float>(source_size), source_limit_samples);
+        
+        // Don't loop - if we've reached the end of the usable source audio, output silence
+        if (source_sample_index >= effective_source_size) {
+            output[i] = 0.0f;
+            continue;
+        }
+        
+        // Apply fade envelope for smoother transitions
+        float envelope = 1.0f;
+        const float fade_time = 0.01f; // 10ms fade
+        float source_time = source_sample_index / source_sample_rate;
+        float source_duration = effective_source_size / source_sample_rate;
+        
+        // Fade in at start
+        if (source_time < fade_time) {
+            envelope = source_time / fade_time;
+        }
+        // Fade out at end
+        else if (source_time > source_duration - fade_time) {
+            envelope = (source_duration - source_time) / fade_time;
         }
         
         // Get the two samples for linear interpolation
-        size_t source_index = static_cast<size_t>(wrapped_index);
-        size_t next_index = (source_index + 1) % source_size;
+        size_t source_index = static_cast<size_t>(source_sample_index);
+        size_t next_index = std::min(source_index + 1, static_cast<size_t>(effective_source_size) - 1);
         
         // Linear interpolation for smoother playback
-        float fraction = wrapped_index - std::floor(wrapped_index);
+        float fraction = source_sample_index - std::floor(source_sample_index);
         float sample1 = wav.samples[source_index];
         float sample2 = wav.samples[next_index];
-        output[i] = sample1 + (sample2 - sample1) * fraction;
+        output[i] = (sample1 + (sample2 - sample1) * fraction) * envelope;
     }
 }
 
@@ -872,13 +948,21 @@ bool processSpatialAudio(const std::vector<DetectionFrame>& detectionFrames,
 
             zeroBuffer(resources.inputBuffer);
 
-            auto audioIt = audioFiles.find(objectId);
+            // Get audio params for this slot (pitch shift and rhythmic beat timing)
+            ObjectAudioParams audioParams = ObjectAudioParams::forSlot(effectSlot);
+            
+            // Use the base audio file (id 0) for all objects, with pitch/rhythm variation
+            auto audioIt = audioFiles.find(0);
             if (audioIt != audioFiles.end()) {
                 getAudioSamples(audioIt->second,
                                 resources.inputBuffer.data[0],
                                 FRAME_SIZE,
                                 currentTimeSec,
-                                SAMPLE_RATE);
+                                SAMPLE_RATE,
+                                audioParams.pitchRatio,
+                                audioParams.beatOffset,
+                                audioParams.beatCycleSec,
+                                audioParams.beatDurationSec);
             }
 
             const float fadeVolume = tracker.getFadeVolume(objectId);
@@ -981,9 +1065,9 @@ int main(int argc, char* argv[]) {
     }
 
     std::unordered_map<int, WAVFile> audioFiles;
+    // Single base audio file - pitch shifting and timing offsets differentiate objects
     const std::vector<ObjectAudioConfig> audioConfigs = {
-        {1, "beep_1.wav"},
-        {2, "beep_2.wav"},
+        {0, "beep_1.wav"},  // Base audio for all objects (id 0)
     };
 
     if (!loadObjectAudio(audioConfigs, audioFiles)) {
