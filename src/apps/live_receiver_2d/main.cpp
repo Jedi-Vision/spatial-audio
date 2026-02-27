@@ -4,7 +4,7 @@
 
 #include <fmt/format.h>
 
-#include "socket_payload_parser.h"
+#include <jsa/protocol/frame_parser.hpp>
 
 #include <algorithm>
 #include <array>

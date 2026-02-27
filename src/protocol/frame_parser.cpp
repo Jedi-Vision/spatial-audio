@@ -1,4 +1,4 @@
-#include "socket_payload_parser.h"
+#include <jsa/protocol/frame_parser.hpp>
 
 #include <cstring>
 
@@ -47,6 +47,8 @@ bool readChar(const uint8_t* data,
 }
 
 } // namespace
+
+namespace jsa::protocol {
 
 bool parseSocketObjectRep(const uint8_t* data,
                           size_t len,
@@ -159,3 +161,5 @@ bool parseSocketObjectRep(const uint8_t* data,
 
     return true;
 }
+
+} // namespace jsa::protocol

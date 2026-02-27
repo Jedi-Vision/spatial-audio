@@ -12,22 +12,50 @@ include(AddJsaExecutable)
 
 jsa_find_dependencies()
 
-add_library(jsa_protocol STATIC socket_payload_parser.cpp)
-target_include_directories(jsa_protocol PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+add_library(jsa_protocol STATIC src/protocol/frame_parser.cpp)
+target_include_directories(
+    jsa_protocol
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
 jsa_apply_project_options(jsa_protocol)
 
-add_library(jsa_core INTERFACE)
-add_library(jsa_tracking INTERFACE)
+add_library(
+    jsa_core
+    STATIC
+    src/core/resource_locator.cpp
+    src/core/wav_io.cpp
+    src/core/math_coords.cpp
+)
+target_include_directories(
+    jsa_core
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+jsa_apply_project_options(jsa_core)
+
+add_library(
+    jsa_tracking
+    STATIC
+    src/tracking/tracker_2d.cpp
+    src/tracking/tracker_3d.cpp
+)
+target_include_directories(
+    jsa_tracking
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+jsa_apply_project_options(jsa_tracking)
 
 jsa_add_executable(
     spatial-audio-demo
-    SOURCES spatial-audio-demo.cpp
+    SOURCES src/apps/demo/main.cpp
     LINK_LIBS fmt::fmt unofficial::steam-audio::phonon jsa_core
 )
 
 jsa_add_executable(
     object-spatial-audio
-    SOURCES object-spatial-audio.cpp
+    SOURCES src/apps/offline_renderer/main.cpp
     LINK_LIBS
         fmt::fmt
         unofficial::steam-audio::phonon
@@ -38,7 +66,7 @@ jsa_add_executable(
 
 jsa_add_executable(
     socket-spatial-audio-live
-    SOURCES socket-spatial-audio-live.cpp
+    SOURCES src/apps/live_receiver_2d/main.cpp
     LINK_LIBS
         fmt::fmt
         unofficial::steam-audio::phonon
@@ -51,7 +79,7 @@ jsa_add_executable(
 
 jsa_add_executable(
     spatial_audio_live_new
-    SOURCES spatial_audio_live_new.cpp
+    SOURCES src/apps/live_receiver_3d/main.cpp
     LINK_LIBS
         fmt::fmt
         unofficial::steam-audio::phonon
@@ -62,13 +90,13 @@ jsa_add_executable(
 
 jsa_add_executable(
     socket-orbit-stream-3d
-    SOURCES socket_orbit_stream_3d.cpp
+    SOURCES src/apps/orbit_streamer/main.cpp
     LINK_LIBS PkgConfig::ZMQ
 )
 
 jsa_add_executable(
     render-visual-stream
-    SOURCES render_visual_stream.cpp
+    SOURCES src/apps/visual_monitor/main.cpp
     LINK_LIBS raylib PkgConfig::GLFW3 PkgConfig::ZMQ
 )
 
