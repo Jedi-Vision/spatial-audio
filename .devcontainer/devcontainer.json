@@ -1,0 +1,19 @@
+{
+  "name": "jedi-spatial-audio",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "git clone https://github.com/microsoft/vcpkg.git /home/vscode/vcpkg || true && /home/vscode/vcpkg/bootstrap-vcpkg.sh",
+  "containerEnv": {
+    "VCPKG_ROOT": "/home/vscode/vcpkg"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools"
+      ]
+    }
+  }
+}
