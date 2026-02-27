@@ -26,6 +26,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            jq \
             cmake \
             ninja-build \
             pkg-config \
@@ -38,7 +39,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew update
-          brew install cmake ninja pkg-config zeromq portaudio glfw
+          brew install jq cmake ninja pkg-config zeromq portaudio glfw
+
+      - name: Validate assets manifest
+        run: ./scripts/validate_assets_manifest.sh
+
+      - name: Fetch assets
+        run: ./scripts/fetch_assets.sh
 
       - name: Bootstrap vcpkg
         shell: bash

@@ -3,44 +3,32 @@
   "release": "assets-v1",
   "assets": [
     {
-      "path": "beep_1.wav",
-      "url": "https://github.com/ajinkyagokule/jedi-spatial-audio/releases/download/assets-v1/beep_1.wav",
-      "sha256": "0a19a0cabefba8b0cfcb990dec315e904bbc4f5e10872f69fe1c332d722c9eff",
-      "license": "Project sample asset"
-    },
-    {
-      "path": "beep_2.wav",
-      "url": "https://github.com/ajinkyagokule/jedi-spatial-audio/releases/download/assets-v1/beep_2.wav",
-      "sha256": "1db3cc7c88ef4c75ebaddbd96d11d29ad0e2ceb353d0695358955eca755097d8",
-      "license": "Project sample asset"
-    },
-    {
       "path": "lucky.wav",
-      "url": "https://github.com/ajinkyagokule/jedi-spatial-audio/releases/download/assets-v1/lucky.wav",
+      "url": "https://github.com/Jedi-Vision/spatial-audio/releases/download/assets-v1/lucky.wav",
       "sha256": "7dd16167b4becc56a26f757f8962761b76aa75f508c0b482182aab1baaa34303",
       "license": "Project sample asset"
     },
     {
       "path": "september.wav",
-      "url": "https://github.com/ajinkyagokule/jedi-spatial-audio/releases/download/assets-v1/september.wav",
+      "url": "https://github.com/Jedi-Vision/spatial-audio/releases/download/assets-v1/september.wav",
       "sha256": "895451124d85b3f5aeb422b04ac687e7f7891769ca2f6abcdd31e3d45dea9bcc",
       "license": "Project sample asset"
     },
     {
       "path": "D2_HRIR_SOFA/D2_44K_16bit_256tap_FIR_SOFA.sofa",
-      "url": "https://github.com/ajinkyagokule/jedi-spatial-audio/releases/download/assets-v1/D2_44K_16bit_256tap_FIR_SOFA.sofa",
+      "url": "https://github.com/Jedi-Vision/spatial-audio/releases/download/assets-v1/D2_44K_16bit_256tap_FIR_SOFA.sofa",
       "sha256": "cbdf7e2addb230f7a991891830184b34cc19924a0fde3d8d488f952258e85aba",
       "license": "SOFA file license from source package"
     },
     {
       "path": "D2_HRIR_SOFA/D2_48K_24bit_256tap_FIR_SOFA.sofa",
-      "url": "https://github.com/ajinkyagokule/jedi-spatial-audio/releases/download/assets-v1/D2_48K_24bit_256tap_FIR_SOFA.sofa",
+      "url": "https://github.com/Jedi-Vision/spatial-audio/releases/download/assets-v1/D2_48K_24bit_256tap_FIR_SOFA.sofa",
       "sha256": "bb4f3d4126e686f438c4dcd8c11541e62393c0d90db1da6f17d1dd13d01c8ef7",
       "license": "SOFA file license from source package"
     },
     {
       "path": "D2_HRIR_SOFA/D2_96K_24bit_512tap_FIR_SOFA.sofa",
-      "url": "https://github.com/ajinkyagokule/jedi-spatial-audio/releases/download/assets-v1/D2_96K_24bit_512tap_FIR_SOFA.sofa",
+      "url": "https://github.com/Jedi-Vision/spatial-audio/releases/download/assets-v1/D2_96K_24bit_512tap_FIR_SOFA.sofa",
       "sha256": "524bb44563c7d4c4ae3b5751c2a02be92aa004fadc8fa71d256bdd5b1d84e268",
       "license": "SOFA file license from source package"
     }

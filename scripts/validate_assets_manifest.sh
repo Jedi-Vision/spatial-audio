@@ -12,31 +12,21 @@ if [[ ! -f "${LOCK_FILE}" ]]; then
   exit 1
 fi
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required to parse ${LOCK_FILE}" >&2
-  exit 1
-fi
+for cmd in jq curl shasum; do
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "${cmd} is required" >&2
+    exit 1
+  fi
+done
 
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl is required to download assets" >&2
-  exit 1
-fi
-
-if ! command -v shasum >/dev/null 2>&1; then
-  echo "shasum is required to verify checksums" >&2
-  exit 1
-fi
-
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "${tmp_dir}"' EXIT
-
-echo "Fetching assets into ${ASSET_ROOT}"
 release_tag="$(jq -r '.release' "${LOCK_FILE}")"
 if [[ -z "${release_tag}" || "${release_tag}" == "null" ]]; then
   echo "Lockfile release tag is missing in ${LOCK_FILE}" >&2
   exit 1
 fi
+
 expected_prefix="https://github.com/${EXPECTED_GITHUB_REPO}/releases/download/${release_tag}/"
+echo "Validating lockfile URLs and checksums for release ${release_tag}"
 
 jq -c '.assets[]' "${LOCK_FILE}" | while IFS= read -r item; do
   rel_path="$(jq -r '.path' <<<"${item}")"
@@ -46,29 +36,30 @@ jq -c '.assets[]' "${LOCK_FILE}" | while IFS= read -r item; do
   expected_url="${expected_prefix}${file_name}"
 
   if [[ "${url}" != "${expected_url}" ]]; then
-    echo "Lockfile URL mismatch for ${rel_path}" >&2
+    echo "URL mismatch for ${rel_path}" >&2
     echo "  expected: ${expected_url}" >&2
     echo "  actual:   ${url}" >&2
     exit 1
   fi
 
-  dest="${ASSET_ROOT}/${rel_path}"
-  dest_dir="$(dirname "${dest}")"
-  mkdir -p "${dest_dir}"
-
-  tmp_file="${tmp_dir}/$(basename "${rel_path}")"
-  echo "  - ${rel_path}"
-  curl --fail --location --silent --show-error "${url}" --output "${tmp_file}"
-
-  sha256_actual="$(shasum -a 256 "${tmp_file}" | awk '{print $1}')"
-  if [[ "${sha256_actual}" != "${sha256_expected}" ]]; then
-    echo "Checksum mismatch for ${rel_path}" >&2
-    echo "  expected: ${sha256_expected}" >&2
-    echo "  actual:   ${sha256_actual}" >&2
+  code="$(curl -I -L -s -o /dev/null -w '%{http_code}' "${url}")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Remote asset unavailable for ${rel_path}: HTTP ${code}" >&2
     exit 1
   fi
 
-  mv "${tmp_file}" "${dest}"
+  local_file="${ASSET_ROOT}/${rel_path}"
+  if [[ -f "${local_file}" ]]; then
+    sha256_actual="$(shasum -a 256 "${local_file}" | awk '{print $1}')"
+    if [[ "${sha256_actual}" != "${sha256_expected}" ]]; then
+      echo "Local checksum mismatch for ${rel_path}" >&2
+      echo "  expected: ${sha256_expected}" >&2
+      echo "  actual:   ${sha256_actual}" >&2
+      exit 1
+    fi
+  fi
+
+  echo "OK ${rel_path}"
 done
 
-echo "Assets fetched and verified."
+echo "Manifest validation succeeded."
