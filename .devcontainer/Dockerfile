@@ -9,4 +9,8 @@ RUN apt-get update && apt-get install -y \
     libzmq3-dev \
     portaudio19-dev \
     libglfw3-dev \
+    libxinerama-dev \
+    libxcursor-dev \
+    xorg-dev \
+    libglu1-mesa-dev \
     && rm -rf /var/lib/apt/lists/*

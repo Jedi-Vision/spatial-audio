@@ -17,7 +17,11 @@ sudo apt-get install -y \
   jq \
   libzmq3-dev \
   portaudio19-dev \
-  libglfw3-dev
+  libglfw3-dev \
+  libxinerama-dev \
+  libxcursor-dev \
+  xorg-dev \
+  libglu1-mesa-dev
 
 required_cmake_version="4.1.0"
 detected_cmake_version="$(cmake --version | awk 'NR==1 { print $3 }')"

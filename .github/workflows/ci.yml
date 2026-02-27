@@ -32,7 +32,18 @@ jobs:
             libzmq3-dev \
             libportaudio2 \
             portaudio19-dev \
-            libglfw3-dev
+            libglfw3-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            xorg-dev \
+            libglu1-mesa-dev
+
+          for header in /usr/include/X11/extensions/Xinerama.h /usr/include/xcb/xinerama.h; do
+            if [[ ! -f "${header}" ]]; then
+              echo "Missing required GLFW/vcpkg header: ${header}" >&2
+              exit 1
+            fi
+          done
 
       - name: Setup CMake 4.1.2 (Linux)
         if: runner.os == 'Linux'
