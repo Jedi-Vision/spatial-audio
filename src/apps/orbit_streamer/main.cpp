@@ -81,6 +81,7 @@ bool parseMotionMode(const char* text, MotionMode& out) {
 
 struct CLIOptions {
     std::string ipcEndpoint = DEFAULT_IPC_ENDPOINT;
+    std::string assetsRoot;
     double fps = DEFAULT_FPS;
     double radiusMeters = DEFAULT_RADIUS_METERS;
     double periodSec = DEFAULT_PERIOD_SECONDS;
@@ -128,6 +129,7 @@ void printUsage(const char* executableName) {
     std::cout << "Usage: " << executableName << " [OPTIONS]\n";
     std::cout << "Options:\n";
     std::cout << "  --ipc <endpoint>      ZeroMQ endpoint (default: ipc:///tmp/jv/audio/0.sock)\n";
+    std::cout << "  --assets-root <path>  Asset root override (unused by this app)\n";
     std::cout << "  --fps <value>         Frames per second (default: 30.0)\n";
     std::cout << "  --radius <meters>     Orbit radius in meters (default: 2.0)\n";
     std::cout << "  --period-sec <sec>    Orbit period in seconds (default: 8.0)\n";
@@ -195,6 +197,13 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             const char* value = requireValue("--ipc");
             if (value != nullptr) {
                 options.ipcEndpoint = value;
+            }
+            continue;
+        }
+        if (arg == "--assets-root") {
+            const char* value = requireValue("--assets-root");
+            if (value != nullptr) {
+                options.assetsRoot = value;
             }
             continue;
         }

@@ -1,5 +1,6 @@
 #include <phonon.h>
 #include <fmt/format.h>
+#include <jsa/core/resource_locator.hpp>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -225,6 +226,7 @@ int main(int argc, char* argv[]) {
     // Parse command-line arguments
     bool useDefaultHRTF = false;
     bool exportTrajectory = false;
+    std::string assetsRoot;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--hrtf") {
@@ -245,19 +247,39 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--export-trajectory" || arg == "-e") {
             exportTrajectory = true;
+        } else if (arg == "--assets-root") {
+            if (i + 1 < argc) {
+                assetsRoot = argv[++i];
+            } else {
+                std::cerr << "Error: --assets-root requires a path argument" << std::endl;
+                return 1;
+            }
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0] << " [OPTIONS]" << std::endl;
             std::cout << "Options:" << std::endl;
             std::cout << "  --hrtf <default|custom>     Use default or custom HRTF (default: custom)" << std::endl;
+            std::cout << "  --assets-root <path>        Asset root override (highest priority)" << std::endl;
             std::cout << "  --export-trajectory, -e     Export trajectory data to CSV file" << std::endl;
             std::cout << "  --help, -h                  Show this help message" << std::endl;
             return 0;
         }
     }
+
+    jsa::core::ResourceLocator resourceLocator;
+    if (!assetsRoot.empty()) {
+        resourceLocator.setAssetsRoot(assetsRoot);
+    }
+
+    std::string resolveErr;
+    const auto resolvedInputPath = resourceLocator.resolveAsset(inputFile, resolveErr);
+    if (!resolvedInputPath.has_value()) {
+        std::cerr << "Error: " << resolveErr << std::endl;
+        return 1;
+    }
     
     // Read input WAV file
     WAVFile inputWAV;
-    if (!readWAV(inputFile, inputWAV)) {
+    if (!readWAV(*resolvedInputPath, inputWAV)) {
         return 1;
     }
 
@@ -314,6 +336,14 @@ int main(int argc, char* argv[]) {
             std::cerr << fmt::format("Warning: Unsupported sample rate {} Hz. Using 48K SOFA file.\n", inputWAV.sampleRate);
             sofaFilePath = "D2_HRIR_SOFA/D2_48K_24bit_256tap_FIR_SOFA.sofa";
         }
+
+        const auto resolvedSofaPath = resourceLocator.resolveAsset(sofaFilePath, resolveErr);
+        if (!resolvedSofaPath.has_value()) {
+            std::cerr << "Error: " << resolveErr << std::endl;
+            iplContextRelease(&context);
+            return 1;
+        }
+        sofaFilePath = *resolvedSofaPath;
         
         hrtfSettings.sofaFileName = sofaFilePath.c_str();
         hrtfSettings.sofaData = nullptr;

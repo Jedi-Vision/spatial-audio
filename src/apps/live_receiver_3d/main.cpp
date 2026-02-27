@@ -3,6 +3,7 @@
 #include <zmq.h>
 
 #include <fmt/format.h>
+#include <jsa/core/resource_locator.hpp>
 #include <jsa/core/wav_io.hpp>
 #include <jsa/protocol/frame_parser.hpp>
 #include <jsa/tracking/tracker_3d.hpp>
@@ -150,6 +151,7 @@ ObjectNoteAllocator gObjectNoteAllocator;
 
 struct CLIOptions {
     std::string ipcEndpoint = DEFAULT_IPC_ENDPOINT;
+    std::string assetsRoot;
     bool useDefaultHRTF = true;
     int deviceIndex = -1;
     int sampleRate = 0;
@@ -289,6 +291,7 @@ void printUsage(const char* executableName) {
     std::cout << "Usage: " << executableName << " [OPTIONS]\n";
     std::cout << "Options:\n";
     std::cout << "  --ipc <endpoint>            ZeroMQ endpoint (default: ipc:///tmp/jv/audio/0.sock)\n";
+    std::cout << "  --assets-root <path>        Asset root override (highest priority)\n";
     std::cout << "  --hrtf <default|custom>     HRTF type (default: default)\n";
     std::cout << "  --device-index <index>      PortAudio output device index (default: -1)\n";
     std::cout << "  --sample-rate <hz>          Output/engine sample rate (0=auto, default: 0)\n";
@@ -389,6 +392,13 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             const char* value = requireValue("--ipc");
             if (value != nullptr) {
                 options.ipcEndpoint = value;
+            }
+            continue;
+        }
+        if (arg == "--assets-root") {
+            const char* value = requireValue("--assets-root");
+            if (value != nullptr) {
+                options.assetsRoot = value;
             }
             continue;
         }
@@ -880,7 +890,9 @@ void getLoopedSongSamples(const WAVFile& wav,
     cursorSamples = cursor;
 }
 
-bool createHRTF(bool useDefault, SteamAudioResources& resources) {
+bool createHRTF(bool useDefault,
+                const std::string& customHrtfPath,
+                SteamAudioResources& resources) {
     IPLHRTFSettings hrtfSettings{};
     hrtfSettings.volume = 1.0f;
     hrtfSettings.normType = IPL_HRTFNORMTYPE_NONE;
@@ -894,8 +906,7 @@ bool createHRTF(bool useDefault, SteamAudioResources& resources) {
                               &resources.hrtf);
     } else {
         hrtfSettings.type = IPL_HRTFTYPE_SOFA;
-        std::string sofaPath(DEFAULT_HRTF_SOFA);
-        hrtfSettings.sofaFileName = sofaPath.c_str();
+        hrtfSettings.sofaFileName = customHrtfPath.c_str();
         hrtfSettings.sofaData = nullptr;
         hrtfSettings.sofaDataSize = 0;
         error = iplHRTFCreate(resources.context,
@@ -913,6 +924,7 @@ bool createHRTF(bool useDefault, SteamAudioResources& resources) {
 
 bool initializeSteamAudioResources(bool useDefaultHRTF,
                                    int sampleRate,
+                                   const std::string& customHrtfPath,
                                    SteamAudioResources& resources) {
     resources.release();
 
@@ -929,7 +941,7 @@ bool initializeSteamAudioResources(bool useDefaultHRTF,
     resources.audioSettings.samplingRate = sampleRate;
     resources.audioSettings.frameSize = FRAME_SIZE;
 
-    if (!createHRTF(useDefaultHRTF, resources)) {
+    if (!createHRTF(useDefaultHRTF, customHrtfPath, resources)) {
         resources.release();
         return false;
     }
@@ -1498,8 +1510,37 @@ int main(int argc, char* argv[]) {
     runtimeConfig.songAPath = options.songAPath;
     runtimeConfig.songBPath = options.songBPath;
 
+    jsa::core::ResourceLocator resourceLocator;
+    if (!options.assetsRoot.empty()) {
+        resourceLocator.setAssetsRoot(options.assetsRoot);
+    }
+
+    std::string resolveErr;
+    std::string customHrtfPath = DEFAULT_HRTF_SOFA;
+    if (!options.useDefaultHRTF) {
+        const auto resolvedHrtf = resourceLocator.resolveAsset(customHrtfPath, resolveErr);
+        if (!resolvedHrtf.has_value()) {
+            std::cerr << fmt::format("Error: {}\n", resolveErr);
+            return 1;
+        }
+        customHrtfPath = *resolvedHrtf;
+    }
+
     SongBank songBank;
     if (runtimeConfig.sourceMode == AudioSourceMode::Songs) {
+        const auto resolvedSongA = resourceLocator.resolveAsset(runtimeConfig.songAPath, resolveErr);
+        if (!resolvedSongA.has_value()) {
+            std::cerr << fmt::format("Error: {}\n", resolveErr);
+            return 1;
+        }
+        const auto resolvedSongB = resourceLocator.resolveAsset(runtimeConfig.songBPath, resolveErr);
+        if (!resolvedSongB.has_value()) {
+            std::cerr << fmt::format("Error: {}\n", resolveErr);
+            return 1;
+        }
+        runtimeConfig.songAPath = *resolvedSongA;
+        runtimeConfig.songBPath = *resolvedSongB;
+
         if (!readWAV(runtimeConfig.songAPath, songBank.songA)) {
             return 1;
         }
@@ -1519,6 +1560,7 @@ int main(int argc, char* argv[]) {
     SteamAudioResources steamAudio;
     if (!initializeSteamAudioResources(options.useDefaultHRTF,
                                        runtimeConfig.sampleRate,
+                                       customHrtfPath,
                                        steamAudio)) {
         shutdownOutputStream(stream);
         return 1;

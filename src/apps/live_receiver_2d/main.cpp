@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 
+#include <jsa/core/resource_locator.hpp>
 #include <jsa/core/wav_io.hpp>
 #include <jsa/protocol/frame_parser.hpp>
 #include <jsa/tracking/tracker_2d.hpp>
@@ -61,6 +62,7 @@ void handleSignal(int) {
 struct CLIOptions {
     std::string ipcEndpoint = DEFAULT_IPC_ENDPOINT;
     std::string audioPath = DEFAULT_AUDIO_FILE;
+    std::string assetsRoot;
     bool useDefaultHRTF = true;
     int deviceIndex = -1;
     bool showHelp = false;
@@ -118,6 +120,7 @@ void printUsage(const char* executableName) {
     std::cout << "Options:\n";
     std::cout << "  --ipc <endpoint>            ZeroMQ endpoint (default: ipc:///tmp/jv/audio/0.sock)\n";
     std::cout << "  --audio <wav>               Mono source WAV path (default: beep_1.wav)\n";
+    std::cout << "  --assets-root <path>        Asset root override (highest priority)\n";
     std::cout << "  --hrtf <default|custom>     HRTF type (default: default)\n";
     std::cout << "  --device-index <index>      PortAudio output device index (default: -1)\n";
     std::cout << "  --help, -h                  Show this help message\n";
@@ -139,6 +142,10 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
         }
         if (arg == "--audio" && i + 1 < argc) {
             options.audioPath = argv[++i];
+            continue;
+        }
+        if (arg == "--assets-root" && i + 1 < argc) {
+            options.assetsRoot = argv[++i];
             continue;
         }
         if (arg == "--hrtf" && i + 1 < argc) {
@@ -314,7 +321,9 @@ void getAudioSamples(const WAVFile& wav,
     }
 }
 
-bool createHRTF(bool useDefault, SteamAudioResources& resources) {
+bool createHRTF(bool useDefault,
+                const std::string& customHrtfPath,
+                SteamAudioResources& resources) {
     IPLHRTFSettings hrtfSettings{};
     hrtfSettings.volume = 1.0f;
     hrtfSettings.normType = IPL_HRTFNORMTYPE_NONE;
@@ -328,8 +337,7 @@ bool createHRTF(bool useDefault, SteamAudioResources& resources) {
                               &resources.hrtf);
     } else {
         hrtfSettings.type = IPL_HRTFTYPE_SOFA;
-        const std::string sofaPath = DEFAULT_HRTF_SOFA;
-        hrtfSettings.sofaFileName = sofaPath.c_str();
+        hrtfSettings.sofaFileName = customHrtfPath.c_str();
         hrtfSettings.sofaData = nullptr;
         hrtfSettings.sofaDataSize = 0;
         error = iplHRTFCreate(resources.context,
@@ -345,7 +353,9 @@ bool createHRTF(bool useDefault, SteamAudioResources& resources) {
     return true;
 }
 
-bool initializeSteamAudioResources(bool useDefaultHRTF, SteamAudioResources& resources) {
+bool initializeSteamAudioResources(bool useDefaultHRTF,
+                                   const std::string& customHrtfPath,
+                                   SteamAudioResources& resources) {
     resources.release();
 
     IPLContextSettings contextSettings{};
@@ -361,7 +371,7 @@ bool initializeSteamAudioResources(bool useDefaultHRTF, SteamAudioResources& res
     resources.audioSettings.samplingRate = SAMPLE_RATE;
     resources.audioSettings.frameSize = FRAME_SIZE;
 
-    if (!createHRTF(useDefaultHRTF, resources)) {
+    if (!createHRTF(useDefaultHRTF, customHrtfPath, resources)) {
         resources.release();
         return false;
     }
@@ -708,13 +718,34 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    jsa::core::ResourceLocator resourceLocator;
+    if (!options.assetsRoot.empty()) {
+        resourceLocator.setAssetsRoot(options.assetsRoot);
+    }
+
+    std::string resolveErr;
+    const auto resolvedAudioPath = resourceLocator.resolveAsset(options.audioPath, resolveErr);
+    if (!resolvedAudioPath.has_value()) {
+        std::cerr << fmt::format("Error: {}\n", resolveErr);
+        return 1;
+    }
+
+    const std::string customHrtfPath = DEFAULT_HRTF_SOFA;
+    const auto resolvedHrtfPath = resourceLocator.resolveAsset(customHrtfPath, resolveErr);
+    if (!options.useDefaultHRTF && !resolvedHrtfPath.has_value()) {
+        std::cerr << fmt::format("Error: {}\n", resolveErr);
+        return 1;
+    }
+
     WAVFile sourceAudio;
-    if (!readWAV(options.audioPath, sourceAudio)) {
+    if (!readWAV(*resolvedAudioPath, sourceAudio)) {
         return 1;
     }
 
     SteamAudioResources steamAudio;
-    if (!initializeSteamAudioResources(options.useDefaultHRTF, steamAudio)) {
+    const std::string hrtfPathForInit =
+        resolvedHrtfPath.has_value() ? *resolvedHrtfPath : customHrtfPath;
+    if (!initializeSteamAudioResources(options.useDefaultHRTF, hrtfPathForInit, steamAudio)) {
         return 1;
     }
 

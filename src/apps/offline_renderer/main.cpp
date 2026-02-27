@@ -1,5 +1,6 @@
 #include <phonon.h>
 #include <fmt/format.h>
+#include <jsa/core/resource_locator.hpp>
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <fstream>
@@ -71,6 +72,7 @@ struct WAVFile {
 struct CLIOptions {
     std::string detectionsPath = std::string(DEFAULT_DETECTION_FILE);
     std::string outputPath = std::string(DEFAULT_OUTPUT_FILE);
+    std::string assetsRoot;
     bool useDefaultHRTF = true;
     bool showHelp = false;
 };
@@ -323,6 +325,7 @@ bool readWAV(const std::string& filename, WAVFile& wav) {
 void printUsage(const char* executableName) {
     std::cout << "Usage: " << executableName << " [INPUT_JSON] [OUTPUT_WAV] [OPTIONS]\n";
     std::cout << "Options:\n";
+    std::cout << "  --assets-root <path>        Asset root override (highest priority)\n";
     std::cout << "  --hrtf <default|custom>     Use default or custom HRTF (default: default)\n";
     std::cout << "  --help, -h                  Show this help message\n";
 }
@@ -342,6 +345,8 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
         if (arg == "--hrtf" && i + 1 < argc) {
             std::string_view hrtfType(argv[++i]);
             options.useDefaultHRTF = (hrtfType == "default");
+        } else if (arg == "--assets-root" && i + 1 < argc) {
+            options.assetsRoot = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
             options.showHelp = true;
         }
@@ -774,7 +779,9 @@ float calculateInterpolationFactor(float currentTimeMs,
     return 0.0f;
 }
 
-bool createHRTF(bool useDefaultHRTF, SteamAudioResources& resources) {
+bool createHRTF(bool useDefaultHRTF,
+                const std::string& customHrtfPath,
+                SteamAudioResources& resources) {
     IPLHRTFSettings hrtfSettings{};
     hrtfSettings.volume = 1.0f;
     hrtfSettings.normType = IPL_HRTFNORMTYPE_NONE;
@@ -786,11 +793,10 @@ bool createHRTF(bool useDefaultHRTF, SteamAudioResources& resources) {
         error = iplHRTFCreate(resources.context, &resources.audioSettings, &hrtfSettings, &resources.hrtf);
     } else {
         hrtfSettings.type = IPL_HRTFTYPE_SOFA;
-        std::string sofaFile(DEFAULT_HRTF_SOFA);
-        hrtfSettings.sofaFileName = sofaFile.c_str();
+        hrtfSettings.sofaFileName = customHrtfPath.c_str();
         hrtfSettings.sofaData = nullptr;
         hrtfSettings.sofaDataSize = 0;
-        std::cout << fmt::format("Loading HRTF from SOFA file: {}\n", sofaFile);
+        std::cout << fmt::format("Loading HRTF from SOFA file: {}\n", customHrtfPath);
         error = iplHRTFCreate(resources.context, &resources.audioSettings, &hrtfSettings, &resources.hrtf);
     }
 
@@ -803,7 +809,9 @@ bool createHRTF(bool useDefaultHRTF, SteamAudioResources& resources) {
     return true;
 }
 
-bool initializeSteamAudioResources(bool useDefaultHRTF, SteamAudioResources& resources) {
+bool initializeSteamAudioResources(bool useDefaultHRTF,
+                                   const std::string& customHrtfPath,
+                                   SteamAudioResources& resources) {
     resources.release();
 
     IPLContextSettings contextSettings{};
@@ -820,7 +828,7 @@ bool initializeSteamAudioResources(bool useDefaultHRTF, SteamAudioResources& res
     resources.audioSettings.samplingRate = SAMPLE_RATE;
     resources.audioSettings.frameSize = FRAME_SIZE;
 
-    if (!createHRTF(useDefaultHRTF, resources)) {
+    if (!createHRTF(useDefaultHRTF, customHrtfPath, resources)) {
         resources.release();
         return false;
     }
@@ -1070,11 +1078,25 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    jsa::core::ResourceLocator resourceLocator;
+    if (!options.assetsRoot.empty()) {
+        resourceLocator.setAssetsRoot(options.assetsRoot);
+    }
+
     std::unordered_map<int, WAVFile> audioFiles;
     // Single base audio file - pitch shifting and timing offsets differentiate objects
-    const std::vector<ObjectAudioConfig> audioConfigs = {
+    std::vector<ObjectAudioConfig> audioConfigs = {
         {0, "beep_1.wav"},  // Base audio for all objects (id 0)
     };
+    std::string resolveErr;
+    for (ObjectAudioConfig& cfg : audioConfigs) {
+        const auto resolvedPath = resourceLocator.resolveAsset(cfg.filePath, resolveErr);
+        if (!resolvedPath.has_value()) {
+            std::cerr << "Error: " << resolveErr << "\n";
+            return 1;
+        }
+        cfg.filePath = *resolvedPath;
+    }
 
     if (!loadObjectAudio(audioConfigs, audioFiles)) {
         return 1;
@@ -1090,8 +1112,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::string customHrtfPath = DEFAULT_HRTF_SOFA;
+    if (!options.useDefaultHRTF) {
+        const auto resolvedHrtfPath = resourceLocator.resolveAsset(customHrtfPath, resolveErr);
+        if (!resolvedHrtfPath.has_value()) {
+            std::cerr << "Error: " << resolveErr << "\n";
+            return 1;
+        }
+        customHrtfPath = *resolvedHrtfPath;
+    }
+
     SteamAudioResources audioResources;
-    if (!initializeSteamAudioResources(options.useDefaultHRTF, audioResources)) {
+    if (!initializeSteamAudioResources(options.useDefaultHRTF, customHrtfPath, audioResources)) {
         return 1;
     }
 

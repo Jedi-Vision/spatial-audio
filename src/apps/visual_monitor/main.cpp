@@ -51,6 +51,7 @@ void handleSignal(int) {
 struct CLIOptions {
     std::string ipcEndpoint = DEFAULT_IPC_ENDPOINT;
     std::string forwardIpcEndpoint = DEFAULT_FORWARD_IPC_ENDPOINT;
+    std::string assetsRoot;
     bool noForward = false;
     int forwardSendTimeoutMs = DEFAULT_FORWARD_SEND_TIMEOUT_MS;
     int forwardRecvTimeoutMs = DEFAULT_FORWARD_RECV_TIMEOUT_MS;
@@ -140,6 +141,7 @@ void printUsage(const char* executableName) {
     std::cout << "Options:\n";
     std::cout << "  --ipc <endpoint>          Upstream ZeroMQ endpoint (default: "
               << DEFAULT_IPC_ENDPOINT << ")\n";
+    std::cout << "  --assets-root <path>      Asset root override (unused by this app)\n";
     std::cout << "  --forward-ipc <endpoint>  Downstream forward endpoint (default: "
               << DEFAULT_FORWARD_IPC_ENDPOINT << ")\n";
     std::cout << "  --no-forward              Disable forwarding to downstream consumer\n";
@@ -216,6 +218,13 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             const char* value = requireValue("--ipc");
             if (value != nullptr) {
                 options.ipcEndpoint = value;
+            }
+            continue;
+        }
+        if (arg == "--assets-root") {
+            const char* value = requireValue("--assets-root");
+            if (value != nullptr) {
+                options.assetsRoot = value;
             }
             continue;
         }

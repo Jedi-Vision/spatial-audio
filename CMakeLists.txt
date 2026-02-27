@@ -115,9 +115,17 @@ if(BUILD_TESTING)
     target_link_libraries(protocol_frame_parser_tests PRIVATE jsa_protocol)
     jsa_apply_project_options(protocol_frame_parser_tests)
 
+    add_executable(resource_locator_tests tests/resource_locator_tests.cpp)
+    target_link_libraries(resource_locator_tests PRIVATE jsa_core)
+    jsa_apply_project_options(resource_locator_tests)
+
     add_test(
         NAME protocol-frame-parser
         COMMAND $<TARGET_FILE:protocol_frame_parser_tests>
+    )
+    add_test(
+        NAME resource-locator
+        COMMAND $<TARGET_FILE:resource_locator_tests>
     )
 
     function(add_help_smoke_test target_name)
