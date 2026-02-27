@@ -2,6 +2,14 @@
 
 Spatial audio tooling for offline rendering and live socket-driven audio playback.
 
+## Prerequisites
+- CMake >= 4.1
+
+## Verify CMake
+```bash
+cmake --version
+```
+
 ## Quick Start
 ```bash
 ./scripts/bootstrap_macos.sh   # or ./scripts/bootstrap_linux.sh

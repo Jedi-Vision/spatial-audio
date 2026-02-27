@@ -4,6 +4,12 @@
 - Xcode command line tools
 - Homebrew
 - `vcpkg` clone
+- CMake >= 4.1
+
+## Verify CMake
+```bash
+cmake --version
+```
 
 ## Bootstrap
 ```bash

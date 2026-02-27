@@ -27,7 +27,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             jq \
-            cmake \
             ninja-build \
             pkg-config \
             libzmq3-dev \
@@ -35,11 +34,33 @@ jobs:
             portaudio19-dev \
             libglfw3-dev
 
+      - name: Setup CMake 4.1.2 (Linux)
+        if: runner.os == 'Linux'
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '4.1.2'
+
       - name: Install macOS system dependencies
         if: runner.os == 'macOS'
         run: |
           brew update
           brew install jq cmake ninja pkg-config zeromq portaudio glfw
+
+      - name: Verify CMake version
+        shell: bash
+        run: |
+          required_major=4
+          required_minor=1
+          cmake_version="$(cmake --version | awk 'NR==1 {print $3}')"
+          IFS='.' read -r detected_major detected_minor detected_patch <<< "$cmake_version"
+
+          if (( detected_major < required_major )) || \
+             (( detected_major == required_major && detected_minor < required_minor )); then
+            echo "CMake >= 4.1.0 is required. Detected: ${cmake_version}" >&2
+            exit 1
+          fi
+
+          echo "Using CMake ${cmake_version}"
 
       - name: Validate assets manifest
         run: ./scripts/validate_assets_manifest.sh
