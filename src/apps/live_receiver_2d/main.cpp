@@ -4,7 +4,9 @@
 
 #include <fmt/format.h>
 
+#include <jsa/core/wav_io.hpp>
 #include <jsa/protocol/frame_parser.hpp>
+#include <jsa/tracking/tracker_2d.hpp>
 
 #include <algorithm>
 #include <array>
@@ -17,7 +19,6 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -57,45 +58,12 @@ void handleSignal(int) {
     gRunning.store(false);
 }
 
-struct WarningLimiter {
-    std::chrono::steady_clock::time_point lastWarning =
-        std::chrono::steady_clock::time_point::min();
-
-    bool shouldLog() {
-        const auto now = std::chrono::steady_clock::now();
-        if (now - lastWarning > std::chrono::seconds(1)) {
-            lastWarning = now;
-            return true;
-        }
-        return false;
-    }
-};
-
-WarningLimiter gXWarningLimiter;
-WarningLimiter gYWarningLimiter;
-
 struct CLIOptions {
     std::string ipcEndpoint = DEFAULT_IPC_ENDPOINT;
     std::string audioPath = DEFAULT_AUDIO_FILE;
     bool useDefaultHRTF = true;
     int deviceIndex = -1;
     bool showHelp = false;
-};
-
-struct WAVHeader {
-    char riff[4] = {'R', 'I', 'F', 'F'};
-    uint32_t chunkSize = 0;
-    char wave[4] = {'W', 'A', 'V', 'E'};
-    char fmt[4] = {'f', 'm', 't', ' '};
-    uint32_t fmtSize = 16;
-    uint16_t audioFormat = 1;
-    uint16_t numChannels = 1;
-    uint32_t sampleRate = 0;
-    uint32_t byteRate = 0;
-    uint16_t blockAlign = 0;
-    uint16_t bitsPerSample = 0;
-    char data[4] = {'d', 'a', 't', 'a'};
-    uint32_t dataSize = 0;
 };
 
 struct WAVFile {
@@ -124,17 +92,6 @@ struct ObjectAudioParams {
         params.beatDurationSec = BEAT_DURATION_MS / 1000.0f;
         return params;
     }
-};
-
-struct TrackedObject {
-    int id = -1;
-    IPLVector3 currentPosition = {0.0f, 0.0f, -1.0f};
-    IPLVector3 previousPosition = {0.0f, 0.0f, -1.0f};
-    float currentDistance = 1.0f;
-    float previousDistance = 1.0f;
-    float fadeVolume = 0.0f;
-    bool active = false;
-    uint64_t lastSeenTimestampUs = 0;
 };
 
 struct SteamAudioResources {
@@ -268,295 +225,24 @@ bool allocateBuffer(IPLContext context,
 }
 
 bool readWAV(const std::string& filename, WAVFile& wav) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << fmt::format("Error: could not open WAV file: {}\n", filename);
+    jsa::core::WavData loaded;
+    std::string err;
+    if (!jsa::core::loadWavFile(filename, loaded, err)) {
+        std::cerr << fmt::format("Error: {}\n", err);
         return false;
     }
 
-    WAVHeader header;
-    file.read(reinterpret_cast<char*>(&header), sizeof(WAVHeader));
+    wav.sampleRate = static_cast<uint32_t>(loaded.sampleRate);
+    wav.numChannels = static_cast<uint16_t>(loaded.channels);
+    wav.bitsPerSample = static_cast<uint16_t>(loaded.bitsPerSample);
+    wav.samples = std::move(loaded.samples);
 
-    if (std::memcmp(header.riff, "RIFF", 4) != 0 || std::memcmp(header.wave, "WAVE", 4) != 0) {
-        std::cerr << "Error: not a valid WAV file\n";
-        return false;
-    }
-
-    if (std::memcmp(header.fmt, "fmt ", 4) != 0) {
-        file.seekg(12);
-        char chunkID[4] = {};
-        uint32_t chunkSize = 0;
-        bool foundFmt = false;
-        while (file.read(chunkID, 4) && file.read(reinterpret_cast<char*>(&chunkSize), 4)) {
-            if (std::memcmp(chunkID, "fmt ", 4) == 0) {
-                file.read(reinterpret_cast<char*>(&header.audioFormat), 2);
-                file.read(reinterpret_cast<char*>(&header.numChannels), 2);
-                file.read(reinterpret_cast<char*>(&header.sampleRate), 4);
-                file.read(reinterpret_cast<char*>(&header.byteRate), 4);
-                file.read(reinterpret_cast<char*>(&header.blockAlign), 2);
-                file.read(reinterpret_cast<char*>(&header.bitsPerSample), 2);
-                if (chunkSize > 16) {
-                    file.seekg(static_cast<std::streamoff>(chunkSize - 16), std::ios::cur);
-                }
-                foundFmt = true;
-                break;
-            }
-            file.seekg(static_cast<std::streamoff>(chunkSize), std::ios::cur);
-        }
-
-        if (!foundFmt) {
-            std::cerr << "Error: could not find fmt chunk\n";
-            return false;
-        }
-
-        while (file.read(chunkID, 4) && file.read(reinterpret_cast<char*>(&header.dataSize), 4)) {
-            if (std::memcmp(chunkID, "data", 4) == 0) {
-                break;
-            }
-            file.seekg(static_cast<std::streamoff>(header.dataSize), std::ios::cur);
-        }
-
-        if (std::memcmp(chunkID, "data", 4) != 0) {
-            std::cerr << "Error: could not find data chunk\n";
-            return false;
-        }
-    }
-
-    if (header.audioFormat != 1) {
-        std::cerr << "Error: only PCM WAV is supported\n";
-        return false;
-    }
-
-    wav.sampleRate = header.sampleRate;
-    wav.numChannels = header.numChannels;
-    wav.bitsPerSample = header.bitsPerSample;
-
-    const int bytesPerSample = header.bitsPerSample / 8;
-    if (bytesPerSample <= 0) {
-        std::cerr << fmt::format("Error: unsupported bits per sample: {}\n", header.bitsPerSample);
-        return false;
-    }
-
-    const size_t numSamples = header.dataSize / (bytesPerSample * header.numChannels);
-    std::vector<uint8_t> rawData(header.dataSize);
-    file.read(reinterpret_cast<char*>(rawData.data()),
-              static_cast<std::streamsize>(rawData.size()));
-
-    if (static_cast<size_t>(file.gcount()) != rawData.size()) {
-        std::cerr << "Error: failed to read full data chunk\n";
-        return false;
-    }
-
-    auto sampleToFloat = [&](const uint8_t* ptr) -> float {
-        switch (header.bitsPerSample) {
-            case 8: {
-                const int32_t value = static_cast<int32_t>(*ptr) - 128;
-                return static_cast<float>(value) / 128.0f;
-            }
-            case 16: {
-                int32_t value = ptr[0] | (ptr[1] << 8);
-                if (value & 0x8000) {
-                    value |= ~0xFFFF;
-                }
-                return static_cast<float>(value) / 32768.0f;
-            }
-            case 24: {
-                int32_t value = ptr[0] | (ptr[1] << 8) | (ptr[2] << 16);
-                if (value & 0x800000) {
-                    value |= ~0xFFFFFF;
-                }
-                return static_cast<float>(value) / 8388608.0f;
-            }
-            case 32: {
-                const int32_t value =
-                    ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24);
-                return static_cast<float>(value) / 2147483648.0f;
-            }
-            default:
-                return 0.0f;
-        }
-    };
-
-    wav.samples.resize(numSamples);
-    for (size_t i = 0; i < numSamples; ++i) {
-        float mixed = 0.0f;
-        for (uint16_t channel = 0; channel < header.numChannels; ++channel) {
-            const size_t offset = (i * header.numChannels + channel) * bytesPerSample;
-            mixed += sampleToFloat(&rawData[offset]);
-        }
-        wav.samples[i] = mixed / static_cast<float>(header.numChannels);
-    }
-
-    std::cout << fmt::format("Loaded WAV: {} ({} Hz, {} samples)\n",
-                             filename,
-                             wav.sampleRate,
-                             wav.samples.size());
+    std::cout << fmt::format(
+        "Loaded WAV: {} ({} Hz, {} samples)\n", filename, wav.sampleRate, wav.samples.size());
     return true;
 }
 
-float clampNormalized(double value, const char* axisName) {
-    if (!std::isfinite(value)) {
-        if ((axisName[0] == 'x' && gXWarningLimiter.shouldLog()) ||
-            (axisName[0] == 'y' && gYWarningLimiter.shouldLog())) {
-            std::cerr << fmt::format("Warning: non-finite {} coordinate, clamping to 0.5\n",
-                                     axisName);
-        }
-        return 0.5f;
-    }
-
-    if (value < 0.0 || value > 1.0) {
-        if ((axisName[0] == 'x' && gXWarningLimiter.shouldLog()) ||
-            (axisName[0] == 'y' && gYWarningLimiter.shouldLog())) {
-            std::cerr << fmt::format(
-                "Warning: {} coordinate out of range [{:.4f}], clamping to [0,1]\n",
-                axisName,
-                value);
-        }
-    }
-
-    float clamped = static_cast<float>(value);
-    if (clamped < 0.0f) {
-        clamped = 0.0f;
-    } else if (clamped > 1.0f) {
-        clamped = 1.0f;
-    }
-    return clamped;
-}
-
-IPLVector3 convertToWorldSpace(float x2d, float y2d, float depth) {
-    constexpr float kPi = 3.14159265358979323846f;
-    const float normalizedX = x2d - 0.5f;
-    const float normalizedY = 0.5f - y2d;
-    const float fovHRad = CAMERA_FOV_HORIZONTAL_DEG * kPi / 180.0f;
-    const float fovVRad = CAMERA_FOV_VERTICAL_DEG * kPi / 180.0f;
-
-    const float horizontalAngle = normalizedX * fovHRad;
-    const float verticalAngle = normalizedY * fovVRad;
-
-    IPLVector3 position{};
-    position.x = depth * std::tan(horizontalAngle);
-    position.y = depth * std::tan(verticalAngle);
-    position.z = -depth;
-    return position;
-}
-
-class ObjectTracker {
-public:
-    ObjectTracker()
-        : fadeInSamples((FADE_IN_TIME_MS / 1000.0f) * SAMPLE_RATE),
-          fadeOutSamples((FADE_OUT_TIME_MS / 1000.0f) * SAMPLE_RATE) {}
-
-    void updateFromFrame(const SocketFrameData& frame,
-                         uint64_t currentTimeUs,
-                         float updateSamples) {
-        for (auto& pair : trackedObjects) {
-            pair.second.active = false;
-        }
-
-        const float fadeInStep = std::max(0.0f, updateSamples / fadeInSamples);
-        const float fadeOutStep = std::max(0.0f, updateSamples / fadeOutSamples);
-
-        for (const auto& obj : frame.objects) {
-            const float xNorm = clampNormalized(obj.x_2d, "x");
-            const float yNorm = clampNormalized(obj.y_2d, "y");
-
-            float depth = static_cast<float>(obj.depth);
-            if (!std::isfinite(depth) || depth <= 0.0f) {
-                depth = 0.1f;
-            }
-
-            const IPLVector3 position = convertToWorldSpace(xNorm, yNorm, depth);
-
-            auto it = trackedObjects.find(obj.id);
-            if (it != trackedObjects.end()) {
-                TrackedObject& tracked = it->second;
-                tracked.previousPosition = tracked.currentPosition;
-                tracked.previousDistance = tracked.currentDistance;
-                tracked.currentPosition = position;
-                tracked.currentDistance = depth;
-                tracked.active = true;
-                tracked.lastSeenTimestampUs = currentTimeUs;
-                tracked.fadeVolume = std::min(1.0f, tracked.fadeVolume + fadeInStep);
-            } else {
-                TrackedObject tracked;
-                tracked.id = obj.id;
-                tracked.currentPosition = position;
-                tracked.previousPosition = position;
-                tracked.currentDistance = depth;
-                tracked.previousDistance = depth;
-                tracked.active = true;
-                tracked.fadeVolume = std::min(1.0f, fadeInStep);
-                tracked.lastSeenTimestampUs = currentTimeUs;
-                trackedObjects[obj.id] = tracked;
-            }
-        }
-
-        for (auto& pair : trackedObjects) {
-            TrackedObject& tracked = pair.second;
-            if (!tracked.active) {
-                tracked.fadeVolume = std::max(0.0f, tracked.fadeVolume - fadeOutStep);
-            }
-        }
-
-        for (auto it = trackedObjects.begin(); it != trackedObjects.end();) {
-            const TrackedObject& tracked = it->second;
-            if (!tracked.active && tracked.fadeVolume <= 0.0f &&
-                currentTimeUs > tracked.lastSeenTimestampUs &&
-                (currentTimeUs - tracked.lastSeenTimestampUs) > 2000000ULL) {
-                it = trackedObjects.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    std::vector<std::pair<int, IPLVector3>> getInterpolatedPositions(float interpolationFactor) const {
-        std::vector<std::pair<int, IPLVector3>> positions;
-
-        for (const auto& pair : trackedObjects) {
-            const TrackedObject& tracked = pair.second;
-            if (tracked.fadeVolume <= 0.0f) {
-                continue;
-            }
-
-            IPLVector3 interpolated{};
-            interpolated.x = tracked.previousPosition.x +
-                             (tracked.currentPosition.x - tracked.previousPosition.x) *
-                                 interpolationFactor;
-            interpolated.y = tracked.previousPosition.y +
-                             (tracked.currentPosition.y - tracked.previousPosition.y) *
-                                 interpolationFactor;
-            interpolated.z = tracked.previousPosition.z +
-                             (tracked.currentPosition.z - tracked.previousPosition.z) *
-                                 interpolationFactor;
-            positions.push_back({tracked.id, interpolated});
-        }
-
-        if (positions.size() > MAX_SIMULTANEOUS_OBJECTS) {
-            std::sort(positions.begin(),
-                      positions.end(),
-                      [this](const auto& a, const auto& b) {
-                          return getFadeVolume(a.first) > getFadeVolume(b.first);
-                      });
-            positions.resize(MAX_SIMULTANEOUS_OBJECTS);
-        }
-
-        return positions;
-    }
-
-    float getFadeVolume(int objectId) const {
-        const auto it = trackedObjects.find(objectId);
-        if (it == trackedObjects.end()) {
-            return 0.0f;
-        }
-        return it->second.fadeVolume;
-    }
-
-private:
-    std::unordered_map<int, TrackedObject> trackedObjects;
-    float fadeInSamples = 0.0f;
-    float fadeOutSamples = 0.0f;
-};
+using ObjectTracker = jsa::tracking::Tracker2D;
 
 void getAudioSamples(const WAVFile& wav,
                      float* output,
@@ -1072,7 +758,12 @@ int main(int argc, char* argv[]) {
     std::cout << fmt::format("Listening on {}\n", options.ipcEndpoint);
     std::cout << "Press Ctrl+C to stop.\n";
 
-    ObjectTracker tracker;
+    ObjectTracker tracker(SAMPLE_RATE,
+                          CAMERA_FOV_HORIZONTAL_DEG,
+                          CAMERA_FOV_VERTICAL_DEG,
+                          FADE_IN_TIME_MS,
+                          FADE_OUT_TIME_MS,
+                          MAX_SIMULTANEOUS_OBJECTS);
     std::unordered_map<int, int> objectToSlot;
     std::array<int, MAX_SIMULTANEOUS_OBJECTS> slotToObject;
     slotToObject.fill(-1);

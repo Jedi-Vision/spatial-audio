@@ -45,10 +45,13 @@ add_library(
     src/tracking/tracker_2d.cpp
     src/tracking/tracker_3d.cpp
 )
+target_link_libraries(jsa_tracking PUBLIC unofficial::steam-audio::phonon)
 target_include_directories(
     jsa_tracking
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    PRIVATE
+        "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include"
 )
 jsa_apply_project_options(jsa_tracking)
 
@@ -91,6 +94,7 @@ jsa_add_executable(
         PkgConfig::ZMQ
         PkgConfig::PORTAUDIO
         jsa_protocol
+        jsa_core
         jsa_tracking
 )
 

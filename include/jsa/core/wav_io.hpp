@@ -8,6 +8,7 @@ namespace jsa::core {
 struct WavData {
     int sampleRate = 0;
     int channels = 0;
+    int bitsPerSample = 0;
     std::vector<float> samples;
 };
 
