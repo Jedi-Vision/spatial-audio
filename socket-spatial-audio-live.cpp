@@ -470,7 +470,7 @@ public:
             auto it = trackedObjects.find(obj.id);
             if (it != trackedObjects.end()) {
                 TrackedObject& tracked = it->second;
-                tracked.previousPosition = tracfked.currentPosition;
+                tracked.previousPosition = tracked.currentPosition;
                 tracked.previousDistance = tracked.currentDistance;
                 tracked.currentPosition = position;
                 tracked.currentDistance = depth;

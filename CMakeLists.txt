@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 4.1)
 
 project(spatial-audio-demo)
+include(CTest)
 
 # Export compile commands for IntelliSense
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -81,3 +82,19 @@ target_link_libraries(
     PkgConfig::GLFW3
     PkgConfig::ZMQ
 )
+
+if(BUILD_TESTING)
+    function(add_help_smoke_test target_name)
+        add_test(
+            NAME help-${target_name}
+            COMMAND $<TARGET_FILE:${target_name}> --help
+        )
+    endfunction()
+
+    add_help_smoke_test(spatial-audio-demo)
+    add_help_smoke_test(object-spatial-audio)
+    add_help_smoke_test(socket-spatial-audio-live)
+    add_help_smoke_test(spatial_audio_live_new)
+    add_help_smoke_test(socket-orbit-stream-3d)
+    add_help_smoke_test(render-visual-stream)
+endif()
