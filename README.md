@@ -24,6 +24,7 @@ The project uses the following dependencies (managed via vcpkg):
 - **steam-audio**: Steam Audio SDK for spatial audio processing
 - **fmt**: Fast formatting library
 - **nlohmann-json**: JSON parsing library
+- **raylib**: Realtime 2D/3D rendering for the live visual monitor
 
 ## Building
 
@@ -47,6 +48,10 @@ The project uses the following dependencies (managed via vcpkg):
 The executables will be in the `build/` directory:
 - `build/spatial-audio-demo` - Basic spatial audio demo
 - `build/object-spatial-audio` - Object tracking spatial audio
+- `build/socket-spatial-audio-live` - Live socket receiver + speaker playback
+- `build/spatial_audio_live_new` - 3D socket receiver + speaker spatial audio
+- `build/socket-orbit-stream-3d` - Synthetic 3D orbit stream generator
+- `build/render-visual-stream` - Realtime 3D socket visualizer + forwarder
 
 ## Usage
 
@@ -104,6 +109,121 @@ Fields:
 ./build/object-spatial-audio sample_detections.json output.wav
 ```
 
+### Live Socket-to-Speaker Spatial Audio
+
+Receives real-time object stream messages over ZeroMQ IPC, spatializes each frame with Steam Audio, and plays directly to your default laptop speaker through PortAudio.
+
+```bash
+./build/socket-spatial-audio-live [OPTIONS]
+```
+
+Options:
+- `--ipc <endpoint>` - ZeroMQ endpoint (default: `ipc:///tmp/jv/audio/0.sock`)
+- `--audio <wav>` - Source beep/sample WAV (default: `beep_1.wav`)
+- `--hrtf <default|custom>` - HRTF mode (default: `default`)
+- `--device-index <int>` - PortAudio output device index (default: `-1`, system default)
+- `--help, -h` - Show help message
+
+Example:
+```bash
+./build/socket-spatial-audio-live --ipc ipc:///tmp/jv/audio/0.sock --audio beep_1.wav --hrtf default
+```
+
+For integration with `jedi-vision-nano-code`, run the vision pipeline with:
+- `output_to: socket`
+- `serial_type: struct`
+
+### 3D Orbit Stream Generator
+
+Generates synthetic 3D object positions and streams them over ZeroMQ IPC for live spatial-audio testing.
+
+```bash
+./build/socket-orbit-stream-3d [OPTIONS]
+```
+
+Options:
+- `--ipc <endpoint>` - ZeroMQ endpoint (default: `ipc:///tmp/jv/audio/0.sock`)
+- `--fps <value>` - Frames per second (default: `30.0`)
+- `--radius <meters>` - Base orbit radius in meters (default: `2.0`)
+- `--period-sec <sec>` - Angular orbit period in seconds (default: `8.0`)
+- `--motion-mode <orbit|wavy|single-wavy>` - Motion profile (default: `orbit`)
+- `--radial-amp <meters>` - Radius modulation amplitude for `wavy` mode (default: `0.75`)
+- `--radial-period-sec <sec>` - Radius modulation period for `wavy` mode (default: `5.0`)
+- `--phase-offset-deg <deg>` - Object 2 radial phase offset for `wavy` mode (default: `180.0`)
+- `--y <meters>` - Constant Y height (default: `0.0`)
+- `--id1 <int>`, `--id2 <int>` - Object IDs (defaults: `1`, `2`)
+- `--label1 <int>`, `--label2 <int>` - Object labels (defaults: `0`, `0`)
+
+Orbit mode example:
+```bash
+./build/socket-orbit-stream-3d --ipc ipc:///tmp/jv/audio/0.sock --motion-mode orbit --radius 2.0 --period-sec 8.0
+```
+
+Wavy mode example (changes distance + position over time):
+```bash
+./build/socket-orbit-stream-3d --ipc ipc:///tmp/jv/audio/0.sock --motion-mode wavy --radius 2.0 --period-sec 8.0 --radial-amp 0.75 --radial-period-sec 5.0 --phase-offset-deg 180
+```
+
+Single-wavy mode example (single moving object with changing distance):
+```bash
+./build/socket-orbit-stream-3d --ipc ipc:///tmp/jv/audio/0.sock --motion-mode single-wavy --radius 2.0 --period-sec 8.0 --radial-amp 0.75 --radial-period-sec 5.0 --id1 1 --label1 0
+```
+
+### Realtime 3D Visual Monitor
+
+Receives orbit-stream frames over ZeroMQ IPC, ACKs upstream, renders objects in a 3D window, and optionally forwards payloads to another endpoint so audio can run simultaneously.
+
+```bash
+./build/render-visual-stream [OPTIONS]
+```
+
+Options:
+- `--ipc <endpoint>` - Upstream endpoint to bind as REP (default: `ipc:///tmp/jv/audio/0.sock`)
+- `--forward-ipc <endpoint>` - Downstream endpoint to forward as REQ (default: `ipc:///tmp/jv/audio/1.sock`)
+- `--no-forward` - Disable forwarding and run as visualization-only receiver
+- `--forward-send-timeout-ms <ms>` - Forward send timeout (default: `100`)
+- `--forward-recv-timeout-ms <ms>` - Forward ACK timeout (default: `100`)
+- `--forward-retries <count>` - Forward retry count (default: `1`)
+- `--width <pixels>` - Window width (default: `1280`)
+- `--height <pixels>` - Window height (default: `720`)
+- `--fps <value>` - Render target FPS (default: `60`)
+- `--trail-seconds <value>` - Trail retention window in seconds (default: `2.0`)
+- `--help, -h` - Show help message
+
+Visualization-only example:
+```bash
+./build/render-visual-stream --ipc ipc:///tmp/jv/audio/0.sock --no-forward
+```
+
+Forwarding example:
+```bash
+./build/render-visual-stream --ipc ipc:///tmp/jv/audio/0.sock --forward-ipc ipc:///tmp/jv/audio/1.sock --forward-send-timeout-ms 100 --forward-recv-timeout-ms 100 --forward-retries 1
+```
+
+Live test trio:
+Terminal A (audio receiver on forwarded endpoint):
+```bash
+./build/spatial_audio_live_new --ipc ipc:///tmp/jv/audio/1.sock --hrtf default --source-mode tones
+```
+Songs mode example (moving songs instead of tones):
+```bash
+./build/spatial_audio_live_new --ipc ipc:///tmp/jv/audio/1.sock --hrtf default --source-mode songs --song-a lucky.wav --song-b september.wav
+```
+`spatial_audio_live_new` supports two source modes:
+- `tones` (default): stable C-major pentatonic-bell tones per object ID.
+- `songs`: continuous per-object song playback with deterministic assignment (`hash(object_id) % 2`) between `song-a` and `song-b`.
+In `songs` mode, each object keeps its own playback cursor while active and the song restarts from the beginning when that object disappears and later reappears.
+
+Terminal B (visualizer + forwarder):
+```bash
+./build/render-visual-stream --ipc ipc:///tmp/jv/audio/0.sock --forward-ipc ipc:///tmp/jv/audio/1.sock --forward-send-timeout-ms 100 --forward-recv-timeout-ms 100 --forward-retries 1
+```
+
+Terminal C (orbit generator):
+```bash
+./build/socket-orbit-stream-3d --ipc ipc:///tmp/jv/audio/0.sock --motion-mode wavy --radius 2.0 --period-sec 8.0 --radial-amp 0.75 --radial-period-sec 5.0 --phase-offset-deg 180
+```
+
 ## Project Structure
 
 ```
@@ -112,6 +232,12 @@ jedi-spatial-audio/
 ├── vcpkg.json                  # vcpkg dependencies
 ├── spatial-audio-demo.cpp      # Basic spatial audio demo
 ├── object-spatial-audio.cpp    # Object tracking spatial audio
+├── socket-spatial-audio-live.cpp # Live socket receiver + speaker playback
+├── spatial_audio_live_new.cpp  # 3D socket receiver + speaker playback
+├── socket_orbit_stream_3d.cpp  # Synthetic 3D orbit stream generator
+├── render_visual_stream.cpp    # Realtime 3D visual monitor + forwarder
+├── socket_payload_parser.h     # Struct socket payload parser API
+├── socket_payload_parser.cpp   # Struct socket payload parser implementation
 ├── sample_detections.json      # Sample object detection data
 ├── D2_HRIR_SOFA/               # HRTF SOFA files
 │   ├── D2_44K_16bit_256tap_FIR_SOFA.sofa
@@ -164,4 +290,3 @@ This project is designed to work with object detection pipelines (e.g., YOLO). T
 
 - [Steam Audio](https://valvesoftware.github.io/steam-audio/) by Valve Software
 - [vcpkg](https://vcpkg.io/) by Microsoft
-

@@ -680,15 +680,21 @@ bool readDetectionFrames(const std::string& filename, std::vector<DetectionFrame
             json j = json::parse(line);
             
             DetectionFrame frame;
-            frame.frame_number = j.value("frame", line_number - 1);
+            frame.frame_number = j.contains("frame_number")
+                                     ? j.value("frame_number", line_number - 1)
+                                     : j.value("frame", line_number - 1);
             frame.timestamp_ms = j.value("timestamp_ms", frame.frame_number * FRAME_INTERVAL_MS);
             
             if (j.contains("objects") && j["objects"].is_array()) {
                 for (const auto& obj_json : j["objects"]) {
                     DetectedObject obj;
                     obj.id = obj_json.value("id", -1);
-                    obj.x_2d = obj_json.value("x", 0.5f);
-                    obj.y_2d = obj_json.value("y", 0.5f);
+                    obj.x_2d = obj_json.contains("x_2d")
+                                   ? obj_json.value("x_2d", 0.5f)
+                                   : obj_json.value("x", 0.5f);
+                    obj.y_2d = obj_json.contains("y_2d")
+                                   ? obj_json.value("y_2d", 0.5f)
+                                   : obj_json.value("y", 0.5f);
                     obj.depth = obj_json.value("depth", 2.0f);
                     obj.confidence = obj_json.value("confidence", 1.0f);
                     obj.class_name = obj_json.value("class", "");
@@ -1102,4 +1108,3 @@ int main(int argc, char* argv[]) {
     std::cout << fmt::format("Successfully created spatial audio: {}\n", options.outputPath);
     return 0;
 }
-
