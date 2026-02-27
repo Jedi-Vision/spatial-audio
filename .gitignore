@@ -10,6 +10,7 @@ install_manifest.txt
 compile_commands.json
 *.cmake
 !CMakeLists.txt
+!cmake/*.cmake
 
 # Compiled binaries
 *.exe
@@ -80,4 +81,3 @@ trajectory_*.png
 
 # Test files (uncomment if you want to ignore test outputs)
 # test_output/
-

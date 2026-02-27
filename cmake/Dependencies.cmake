@@ -1,0 +1,16 @@
+include_guard(GLOBAL)
+
+function(jsa_find_dependencies)
+    find_package(fmt CONFIG REQUIRED)
+    find_package(flatbuffers CONFIG REQUIRED)
+    find_package(pffft CONFIG REQUIRED)
+    find_package(mysofa CONFIG REQUIRED)
+    find_package(steam-audio CONFIG REQUIRED)
+    find_package(nlohmann_json CONFIG REQUIRED)
+    find_package(raylib CONFIG REQUIRED)
+    find_package(PkgConfig REQUIRED)
+
+    pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
+    pkg_check_modules(GLFW3 REQUIRED IMPORTED_TARGET glfw3)
+    pkg_check_modules(PORTAUDIO REQUIRED IMPORTED_TARGET portaudio-2.0)
+endfunction()

@@ -3,84 +3,73 @@ cmake_minimum_required(VERSION 4.1)
 project(spatial-audio-demo)
 include(CTest)
 
-# Export compile commands for IntelliSense
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(fmt CONFIG REQUIRED)
-find_package(flatbuffers CONFIG REQUIRED)
-find_package(pffft CONFIG REQUIRED)
-find_package(mysofa CONFIG REQUIRED)
-find_package(steam-audio CONFIG REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
-find_package(raylib CONFIG REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
-pkg_check_modules(GLFW3 REQUIRED IMPORTED_TARGET glfw3)
-pkg_check_modules(PORTAUDIO REQUIRED IMPORTED_TARGET portaudio-2.0)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(ProjectOptions)
+include(Dependencies)
+include(AddJsaExecutable)
 
-add_executable(spatial-audio-demo spatial-audio-demo.cpp)
+jsa_find_dependencies()
 
-target_link_libraries(spatial-audio-demo PRIVATE fmt::fmt unofficial::steam-audio::phonon)
+add_library(jsa_protocol STATIC socket_payload_parser.cpp)
+target_include_directories(jsa_protocol PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+jsa_apply_project_options(jsa_protocol)
 
-add_executable(object-spatial-audio object-spatial-audio.cpp)
+add_library(jsa_core INTERFACE)
+add_library(jsa_tracking INTERFACE)
 
-target_link_libraries(object-spatial-audio PRIVATE 
-    fmt::fmt 
-    unofficial::steam-audio::phonon
-    nlohmann_json::nlohmann_json
+jsa_add_executable(
+    spatial-audio-demo
+    SOURCES spatial-audio-demo.cpp
+    LINK_LIBS fmt::fmt unofficial::steam-audio::phonon jsa_core
 )
 
-add_executable(
+jsa_add_executable(
+    object-spatial-audio
+    SOURCES object-spatial-audio.cpp
+    LINK_LIBS
+        fmt::fmt
+        unofficial::steam-audio::phonon
+        nlohmann_json::nlohmann_json
+        jsa_core
+        jsa_tracking
+)
+
+jsa_add_executable(
     socket-spatial-audio-live
-    socket-spatial-audio-live.cpp
-    socket_payload_parser.cpp
+    SOURCES socket-spatial-audio-live.cpp
+    LINK_LIBS
+        fmt::fmt
+        unofficial::steam-audio::phonon
+        PkgConfig::ZMQ
+        PkgConfig::PORTAUDIO
+        jsa_protocol
+        jsa_core
+        jsa_tracking
 )
 
-target_link_libraries(
-    socket-spatial-audio-live
-    PRIVATE
-    fmt::fmt
-    unofficial::steam-audio::phonon
-    PkgConfig::ZMQ
-    PkgConfig::PORTAUDIO
-)
-
-add_executable(
+jsa_add_executable(
     spatial_audio_live_new
-    spatial_audio_live_new.cpp
+    SOURCES spatial_audio_live_new.cpp
+    LINK_LIBS
+        fmt::fmt
+        unofficial::steam-audio::phonon
+        PkgConfig::ZMQ
+        PkgConfig::PORTAUDIO
+        jsa_tracking
 )
 
-target_link_libraries(
-    spatial_audio_live_new
-    PRIVATE
-    fmt::fmt
-    unofficial::steam-audio::phonon
-    PkgConfig::ZMQ
-    PkgConfig::PORTAUDIO
-)
-
-add_executable(
+jsa_add_executable(
     socket-orbit-stream-3d
-    socket_orbit_stream_3d.cpp
+    SOURCES socket_orbit_stream_3d.cpp
+    LINK_LIBS PkgConfig::ZMQ
 )
 
-target_link_libraries(
-    socket-orbit-stream-3d
-    PRIVATE
-    PkgConfig::ZMQ
-)
-
-add_executable(
+jsa_add_executable(
     render-visual-stream
-    render_visual_stream.cpp
-)
-
-target_link_libraries(
-    render-visual-stream
-    PRIVATE
-    raylib
-    PkgConfig::GLFW3
-    PkgConfig::ZMQ
+    SOURCES render_visual_stream.cpp
+    LINK_LIBS raylib PkgConfig::GLFW3 PkgConfig::ZMQ
 )
 
 if(BUILD_TESTING)
