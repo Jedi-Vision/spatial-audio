@@ -1,6 +1,8 @@
 #include <raylib.h>
 #include <zmq.h>
 
+#include <jsa/protocol/frame_parser.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -40,8 +42,6 @@ constexpr int MAX_MESSAGES_PER_TICK = 4;
 constexpr double STALE_FADE_START_SECONDS = 0.5;
 constexpr double STALE_DROP_SECONDS = 2.0;
 constexpr size_t MAX_TRAIL_POINTS_PER_OBJECT = 2048;
-constexpr int32_t MAX_OBJECTS_SAFETY_LIMIT = 100000;
-
 std::atomic<bool> gRunning{true};
 
 void handleSignal(int) {
@@ -63,19 +63,8 @@ struct CLIOptions {
     bool valid = true;
 };
 
-struct OrbitObject {
-    int id = -1;
-    int label = -1;
-    double x = 0.0;
-    double y = 0.0;
-    double z = -1.0;
-};
-
-struct OrbitFrame {
-    int frameNumber = 0;
-    double timestampMs = 0.0;
-    std::vector<OrbitObject> objects;
-};
+using OrbitObject = jsa::protocol::Object3DV1;
+using OrbitFrame = jsa::protocol::Frame3DV1;
 
 struct TrailPoint {
     Vector3 position{};
@@ -424,139 +413,6 @@ void* createForwardReqSocket(void* context,
     return socket;
 }
 
-bool readInt32(const uint8_t* data, size_t len, size_t& offset, int32_t& outValue) {
-    if (offset + sizeof(int32_t) > len) {
-        return false;
-    }
-    std::memcpy(&outValue, data + offset, sizeof(int32_t));
-    offset += sizeof(int32_t);
-    return true;
-}
-
-bool readDouble(const uint8_t* data, size_t len, size_t& offset, double& outValue) {
-    if (offset + sizeof(double) > len) {
-        return false;
-    }
-    std::memcpy(&outValue, data + offset, sizeof(double));
-    offset += sizeof(double);
-    return true;
-}
-
-bool readExpectedChar(const uint8_t* data, size_t len, size_t& offset, char expected) {
-    if (offset >= len) {
-        return false;
-    }
-    if (static_cast<char>(data[offset]) != expected) {
-        return false;
-    }
-    ++offset;
-    return true;
-}
-
-bool parseOrbitPayload(const uint8_t* data,
-                       size_t len,
-                       OrbitFrame& outFrame,
-                       std::string& errorMessage) {
-    outFrame = {};
-    errorMessage.clear();
-
-    if (data == nullptr) {
-        errorMessage = "Input payload pointer is null.";
-        return false;
-    }
-    if (len < sizeof(int32_t) + sizeof(double) + 1 + sizeof(int32_t)) {
-        errorMessage = "Payload too short.";
-        return false;
-    }
-
-    size_t offset = 0;
-    int32_t frameNumber = 0;
-    double timestampMs = 0.0;
-    if (!readInt32(data, len, offset, frameNumber)) {
-        errorMessage = "Failed to read frame_number.";
-        return false;
-    }
-    if (!readDouble(data, len, offset, timestampMs)) {
-        errorMessage = "Failed to read timestamp_ms.";
-        return false;
-    }
-    if (!readExpectedChar(data, len, offset, '^')) {
-        errorMessage = "Missing list start marker '^'.";
-        return false;
-    }
-
-    int32_t objectCount = 0;
-    if (!readInt32(data, len, offset, objectCount)) {
-        errorMessage = "Failed to read object count.";
-        return false;
-    }
-    if (objectCount < 0) {
-        errorMessage = "Object count is negative.";
-        return false;
-    }
-    if (objectCount > MAX_OBJECTS_SAFETY_LIMIT) {
-        errorMessage = "Object count exceeds safety limit.";
-        return false;
-    }
-
-    outFrame.frameNumber = frameNumber;
-    outFrame.timestampMs = timestampMs;
-    outFrame.objects.clear();
-    outFrame.objects.reserve(static_cast<size_t>(objectCount));
-
-    for (int32_t i = 0; i < objectCount; ++i) {
-        if (!readExpectedChar(data, len, offset, '|')) {
-            errorMessage = "Missing object delimiter '|'.";
-            return false;
-        }
-
-        OrbitObject object;
-        int32_t id = -1;
-        int32_t label = -1;
-        double x = 0.0;
-        double y = 0.0;
-        double z = -1.0;
-
-        if (!readInt32(data, len, offset, id)) {
-            errorMessage = "Failed to read object id.";
-            return false;
-        }
-        if (!readInt32(data, len, offset, label)) {
-            errorMessage = "Failed to read object label.";
-            return false;
-        }
-        if (!readDouble(data, len, offset, x)) {
-            errorMessage = "Failed to read object x.";
-            return false;
-        }
-        if (!readDouble(data, len, offset, y)) {
-            errorMessage = "Failed to read object y.";
-            return false;
-        }
-        if (!readDouble(data, len, offset, z)) {
-            errorMessage = "Failed to read object z.";
-            return false;
-        }
-
-        object.id = id;
-        object.label = label;
-        object.x = x;
-        object.y = y;
-        object.z = z;
-        outFrame.objects.push_back(object);
-    }
-
-    if (offset < len && static_cast<char>(data[offset]) == '^') {
-        ++offset;
-    }
-    if (offset != len) {
-        errorMessage = "Trailing bytes found after payload parse.";
-        return false;
-    }
-
-    return true;
-}
-
 ForwardResult forwardPayloadWithRetry(void*& forwardSocket,
                                       void* context,
                                       const std::string& endpoint,
@@ -821,7 +677,7 @@ int main(int argc, char* argv[]) {
 
             OrbitFrame frame;
             std::string parseError;
-            const bool parsed = parseOrbitPayload(payload, payloadLen, frame, parseError);
+            const bool parsed = jsa::protocol::parseFrame3DV1(payload, payloadLen, frame, parseError);
 
             const char ack = parsed ? '0' : '1';
             if (zmq_send(upstreamSocket, &ack, 1, 0) == -1) {
@@ -847,8 +703,8 @@ int main(int argc, char* argv[]) {
 
             ++stats.receivedFrames;
             fpsEstimator.noteFrame(nowSec);
-            latestFrameNumber = frame.frameNumber;
-            latestTimestampMs = frame.timestampMs;
+            latestFrameNumber = frame.frame_number;
+            latestTimestampMs = frame.timestamp_ms;
             latestObjectCount = frame.objects.size();
             hasFrame = true;
 

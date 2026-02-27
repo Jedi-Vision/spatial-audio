@@ -1,21 +1,3 @@
 #pragma once
 
-#include <vector>
-
-namespace jsa::protocol {
-
-struct SocketObjectData {
-    int id = -1;
-    int label = -1;
-    double x_2d = 0.5;
-    double y_2d = 0.5;
-    double depth = 1.0;
-};
-
-struct SocketFrameData {
-    int frame_number = 0;
-    double timestamp_ms = 0.0;
-    std::vector<SocketObjectData> objects;
-};
-
-} // namespace jsa::protocol
+#include <jsa/protocol/frame_2d_v1.hpp>

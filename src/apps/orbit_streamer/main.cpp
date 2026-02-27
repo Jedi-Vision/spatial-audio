@@ -1,5 +1,8 @@
 #include <zmq.h>
 
+#include <jsa/protocol/frame_3d_v1.hpp>
+#include <jsa/protocol/frame_serializer.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -94,19 +97,8 @@ struct CLIOptions {
     bool valid = true;
 };
 
-struct OrbitObject {
-    int id = -1;
-    int label = 0;
-    double x = 0.0;
-    double y = 0.0;
-    double z = -1.0;
-};
-
-struct OrbitFrame {
-    int frameNumber = 0;
-    double timestampMs = 0.0;
-    std::vector<OrbitObject> objects;
-};
+using OrbitObject = jsa::protocol::Object3DV1;
+using OrbitFrame = jsa::protocol::Frame3DV1;
 
 struct Stats {
     uint64_t sent = 0;
@@ -341,39 +333,6 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
     return options;
 }
 
-template <typename T>
-void appendPod(std::vector<uint8_t>& out, const T& value) {
-    const size_t oldSize = out.size();
-    out.resize(oldSize + sizeof(T));
-    std::memcpy(out.data() + oldSize, &value, sizeof(T));
-}
-
-std::vector<uint8_t> serializeFrame(const OrbitFrame& frame) {
-    std::vector<uint8_t> payload;
-    const size_t perObjectBytes =
-        1 + sizeof(int32_t) + sizeof(int32_t) + 3 * sizeof(double);
-    payload.reserve(sizeof(int32_t) + sizeof(double) + 1 + sizeof(int32_t) +
-                    frame.objects.size() * perObjectBytes + 1);
-
-    appendPod<int32_t>(payload, static_cast<int32_t>(frame.frameNumber));
-    appendPod<double>(payload, frame.timestampMs);
-    payload.push_back(static_cast<uint8_t>('^'));
-    appendPod<int32_t>(payload, static_cast<int32_t>(frame.objects.size()));
-
-    for (size_t i = 0; i < frame.objects.size(); ++i) {
-        const OrbitObject& object = frame.objects[i];
-        payload.push_back(static_cast<uint8_t>('|'));
-        appendPod<int32_t>(payload, static_cast<int32_t>(object.id));
-        appendPod<int32_t>(payload, static_cast<int32_t>(object.label));
-        appendPod<double>(payload, object.x);
-        appendPod<double>(payload, object.y);
-        appendPod<double>(payload, object.z);
-    }
-
-    payload.push_back(static_cast<uint8_t>('^'));
-    return payload;
-}
-
 void maybeInjectMalformedFrame(std::vector<uint8_t>& payload, int frameNumber) {
     if (MALFORMED_FRAME_EVERY_N <= 0) {
         return;
@@ -578,8 +537,8 @@ int main(int argc, char* argv[]) {
         const double theta = omega * t;
 
         OrbitFrame frame;
-        frame.frameNumber = frameNumber;
-        frame.timestampMs = t * 1000.0;
+        frame.frame_number = frameNumber;
+        frame.timestamp_ms = t * 1000.0;
         frame.objects.clear();
 
         const double angleClockwise = -theta;
@@ -614,7 +573,15 @@ int main(int argc, char* argv[]) {
             frame.objects.push_back(object2);
         }
 
-        std::vector<uint8_t> payload = serializeFrame(frame);
+        std::vector<uint8_t> payload;
+        std::string serializeError;
+        if (!jsa::protocol::serializeFrame3DV1(frame, payload, serializeError)) {
+            std::cerr << "Failed to serialize frame " << frameNumber << ": "
+                      << serializeError << "\n";
+            ++stats.otherErrors;
+            ++frameNumber;
+            continue;
+        }
         maybeInjectMalformedFrame(payload, frameNumber);
 
         ++stats.sent;
@@ -646,7 +613,7 @@ int main(int argc, char* argv[]) {
 
         if (frameNumber % 30 == 0) {
             std::cout << "frame=" << frameNumber
-                      << " t_ms=" << frame.timestampMs;
+                      << " t_ms=" << frame.timestamp_ms;
             if (!frame.objects.empty()) {
                 std::cout << " obj1=(" << frame.objects[0].x << "," << frame.objects[0].y << ","
                           << frame.objects[0].z << ")";

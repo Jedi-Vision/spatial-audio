@@ -12,7 +12,12 @@ include(AddJsaExecutable)
 
 jsa_find_dependencies()
 
-add_library(jsa_protocol STATIC src/protocol/frame_parser.cpp)
+add_library(
+    jsa_protocol
+    STATIC
+    src/protocol/frame_parser.cpp
+    src/protocol/frame_serializer.cpp
+)
 target_include_directories(
     jsa_protocol
     PUBLIC
@@ -85,22 +90,32 @@ jsa_add_executable(
         unofficial::steam-audio::phonon
         PkgConfig::ZMQ
         PkgConfig::PORTAUDIO
+        jsa_protocol
         jsa_tracking
 )
 
 jsa_add_executable(
     socket-orbit-stream-3d
     SOURCES src/apps/orbit_streamer/main.cpp
-    LINK_LIBS PkgConfig::ZMQ
+    LINK_LIBS PkgConfig::ZMQ jsa_protocol
 )
 
 jsa_add_executable(
     render-visual-stream
     SOURCES src/apps/visual_monitor/main.cpp
-    LINK_LIBS raylib PkgConfig::GLFW3 PkgConfig::ZMQ
+    LINK_LIBS raylib PkgConfig::GLFW3 PkgConfig::ZMQ jsa_protocol
 )
 
 if(BUILD_TESTING)
+    add_executable(protocol_frame_parser_tests tests/protocol_frame_parser_tests.cpp)
+    target_link_libraries(protocol_frame_parser_tests PRIVATE jsa_protocol)
+    jsa_apply_project_options(protocol_frame_parser_tests)
+
+    add_test(
+        NAME protocol-frame-parser
+        COMMAND $<TARGET_FILE:protocol_frame_parser_tests>
+    )
+
     function(add_help_smoke_test target_name)
         add_test(
             NAME help-${target_name}
