@@ -65,3 +65,11 @@ PortAudio default device, make sure the container runtime provides:
 The repo's `start_container.sh` already exports and mounts these PulseAudio runtime bits
 when the host Pulse socket exists, so `jsa-live-3d` inside that container should auto-pick
 the Pulse output path without needing `--device-index`.
+
+If the host audio server is reachable over TCP instead of a Unix socket, export
+`PULSE_SERVER` before starting the container and the script will forward that value as-is:
+
+```bash
+export PULSE_SERVER=tcp:host.docker.internal:4713
+bash start_container.sh
+```
