@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -178,6 +179,19 @@ struct CLIOptions {
     std::string songBPath = DEFAULT_SONG_B_FILE;
     bool showHelp = false;
     bool valid = true;
+};
+
+enum class OutputDeviceSelectionMode {
+    RequestedIndex,
+    PulseAuto,
+    PortAudioDefault
+};
+
+struct OutputDeviceSelection {
+    int deviceIndex = paNoDevice;
+    OutputDeviceSelectionMode mode = OutputDeviceSelectionMode::PortAudioDefault;
+    bool pulseServerDetected = false;
+    bool pulseDeviceFound = false;
 };
 
 struct RuntimeAudioConfig {
@@ -356,7 +370,7 @@ void printUsage(const char* executableName) {
     std::cout << "  --ipc <endpoint>            ZeroMQ endpoint (default: ipc:///tmp/jv/audio/0.sock)\n";
     std::cout << "  --assets-root <path>        Asset root override (highest priority)\n";
     std::cout << "  --hrtf <default|custom>     HRTF type (default: default)\n";
-    std::cout << "  --device-index <index>      PortAudio output device index (default: -1)\n";
+    std::cout << "  --device-index <index>      PortAudio output device index (default: auto; prefers Pulse when PULSE_SERVER is set)\n";
     std::cout << "  --sample-rate <hz>          Output/engine sample rate (0=auto, default: 0)\n";
     std::cout << "  --feedback-rate-hz <hz>     Beep pulse rate (default: 6.0)\n";
     std::cout << "  --feedback-duty-cycle <0-1> Pulse duty cycle (default: 0.30)\n";
@@ -374,6 +388,106 @@ void printUsage(const char* executableName) {
     std::cout << "  --song-a <wav>              Song A path for songs mode (default: lucky.wav)\n";
     std::cout << "  --song-b <wav>              Song B path for songs mode (default: september.wav)\n";
     std::cout << "  --help, -h                  Show this help message\n";
+}
+
+std::string lowerCaseAscii(std::string_view value) {
+    std::string lowered;
+    lowered.reserve(value.size());
+    for (const unsigned char ch : value) {
+        lowered.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return lowered;
+}
+
+bool hasPulseServer() {
+    const char* pulseServer = std::getenv("PULSE_SERVER");
+    return pulseServer != nullptr && pulseServer[0] != '\0';
+}
+
+const PaHostApiInfo* hostApiInfoForDevice(const PaDeviceInfo& deviceInfo) {
+    const PaHostApiIndex hostApiIndex = deviceInfo.hostApi;
+    if (hostApiIndex < 0 || hostApiIndex >= Pa_GetHostApiCount()) {
+        return nullptr;
+    }
+    return Pa_GetHostApiInfo(hostApiIndex);
+}
+
+int pulseDevicePriority(const PaDeviceInfo& deviceInfo) {
+    if (deviceInfo.maxOutputChannels <= 0) {
+        return std::numeric_limits<int>::max();
+    }
+
+    const std::string deviceName = lowerCaseAscii(deviceInfo.name != nullptr ? deviceInfo.name : "");
+    const PaHostApiInfo* hostApiInfo = hostApiInfoForDevice(deviceInfo);
+    const std::string hostApiName =
+        lowerCaseAscii((hostApiInfo != nullptr && hostApiInfo->name != nullptr) ? hostApiInfo->name : "");
+
+    if (deviceName == "pulse") {
+        return 0;
+    }
+    if (hostApiName.find("pulse") != std::string::npos && deviceName == "default") {
+        return 1;
+    }
+    if (hostApiName.find("pulse") != std::string::npos) {
+        return 2;
+    }
+    if (deviceName.find("pulse") != std::string::npos) {
+        return 3;
+    }
+
+    return std::numeric_limits<int>::max();
+}
+
+OutputDeviceSelection selectOutputDevice(int requestedDeviceIndex, int deviceCount) {
+    if (requestedDeviceIndex >= 0) {
+        return {requestedDeviceIndex, OutputDeviceSelectionMode::RequestedIndex, false, false};
+    }
+
+    OutputDeviceSelection selection{};
+    selection.pulseServerDetected = hasPulseServer();
+    if (selection.pulseServerDetected) {
+        int bestPulseDevice = paNoDevice;
+        int bestPriority = std::numeric_limits<int>::max();
+        for (int deviceIndex = 0; deviceIndex < deviceCount; ++deviceIndex) {
+            const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(deviceIndex);
+            if (deviceInfo == nullptr) {
+                continue;
+            }
+
+            const int priority = pulseDevicePriority(*deviceInfo);
+            if (priority < bestPriority) {
+                bestPriority = priority;
+                bestPulseDevice = deviceIndex;
+            }
+        }
+
+        if (bestPulseDevice != paNoDevice) {
+            selection.deviceIndex = bestPulseDevice;
+            selection.mode = OutputDeviceSelectionMode::PulseAuto;
+            selection.pulseDeviceFound = true;
+            return selection;
+        }
+    }
+
+    selection.deviceIndex = Pa_GetDefaultOutputDevice();
+    selection.mode = OutputDeviceSelectionMode::PortAudioDefault;
+    return selection;
+}
+
+std::string describeOutputSelection(const OutputDeviceSelection& selection) {
+    switch (selection.mode) {
+        case OutputDeviceSelectionMode::RequestedIndex:
+            return "selected via --device-index";
+        case OutputDeviceSelectionMode::PulseAuto:
+            return "auto-selected Pulse output because PULSE_SERVER is set";
+        case OutputDeviceSelectionMode::PortAudioDefault:
+            if (selection.pulseServerDetected && !selection.pulseDeviceFound) {
+                return "fell back to the PortAudio default output because no Pulse output device was found";
+            }
+            return "selected PortAudio's default output device";
+    }
+
+    return "selected output device";
 }
 
 bool parseIntArg(const char* text, int& outValue) {
@@ -1515,10 +1629,8 @@ bool openOutputStream(int requestedDeviceIndex,
         return false;
     }
 
-    int outputDevice = requestedDeviceIndex;
-    if (outputDevice < 0) {
-        outputDevice = Pa_GetDefaultOutputDevice();
-    }
+    const OutputDeviceSelection selection = selectOutputDevice(requestedDeviceIndex, deviceCount);
+    const int outputDevice = selection.deviceIndex;
     if (outputDevice == paNoDevice || outputDevice < 0 || outputDevice >= deviceCount) {
         std::cerr << "Error: no valid output device available\n";
         Pa_Terminate();
@@ -1535,6 +1647,7 @@ bool openOutputStream(int requestedDeviceIndex,
     std::cout << fmt::format("Using PortAudio output device {}: {}\n",
                              outputDevice,
                              deviceInfo->name ? deviceInfo->name : "Unknown");
+    std::cout << fmt::format("Output device selection: {}\n", describeOutputSelection(selection));
 
     int selectedSampleRate = requestedSampleRate;
     const int deviceDefaultSampleRate =

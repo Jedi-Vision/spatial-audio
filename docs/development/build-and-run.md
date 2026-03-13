@@ -27,6 +27,9 @@ Terminal A:
 ./build/jsa-live-3d --ipc ipc:///tmp/jv/audio/1.sock --hrtf default --source-mode songs
 ```
 
+When `PULSE_SERVER` is set, `jsa-live-3d` and `jsa-live-2d` now prefer a Pulse-backed
+PortAudio output device before falling back to PortAudio's default output device.
+
 Optional playback stability tuning:
 ```bash
 ./build/jsa-live-3d \
@@ -47,3 +50,18 @@ Terminal C:
 ```bash
 ./build/jsa-orbit-stream --ipc ipc:///tmp/jv/audio/0.sock --motion-mode wavy
 ```
+
+## Docker On Jetson
+To route container audio through the host Jetson PulseAudio sink instead of an HDMI-biased
+PortAudio default device, make sure the container runtime provides:
+
+- `PULSE_SERVER=unix:/run/user/$UID/pulse/native`
+- `XDG_RUNTIME_DIR=/run/user/$UID`
+- a bind mount for `/run/user/$UID/pulse`
+- a bind mount for `/etc/machine-id`
+- access to `/dev/snd`
+- `--group-add audio`
+
+The repo's `start_container.sh` already exports and mounts these PulseAudio runtime bits
+when the host Pulse socket exists, so `jsa-live-3d` inside that container should auto-pick
+the Pulse output path without needing `--device-index`.
