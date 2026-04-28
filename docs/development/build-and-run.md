@@ -55,21 +55,12 @@ Terminal C:
 To route container audio through the host Jetson PulseAudio sink instead of an HDMI-biased
 PortAudio default device, make sure the container runtime provides:
 
-- `PULSE_SERVER=unix:/run/user/$UID/pulse/native`
-- `XDG_RUNTIME_DIR=/run/user/$UID`
-- a bind mount for `/run/user/$UID/pulse`
+- `PULSE_SERVER=unix:/tmp/pulse/native`
+- a bind mount from `/run/user/1000/pulse/native` to `/tmp/pulse/native`
+- a read-only bind mount from `$HOME/.config/pulse/cookie` to `/root/.config/pulse/cookie`
 - a bind mount for `/etc/machine-id`
-- access to `/dev/snd`
-- `--group-add audio`
 
-The repo's `start_container.sh` already exports and mounts these PulseAudio runtime bits
-when the host Pulse socket exists, so `jsa-live-3d` inside that container should auto-pick
-the Pulse output path without needing `--device-index`.
-
-If the host audio server is reachable over TCP instead of a Unix socket, export
-`PULSE_SERVER` before starting the container and the script will forward that value as-is:
-
-```bash
-export PULSE_SERVER=tcp:host.docker.internal:4713
-bash start_container.sh
-```
+The image also configures `/etc/asound.conf` so ALSA's default device routes through
+PulseAudio. The repo's `start_container.sh` provides these PulseAudio runtime bits, so
+`jsa-live-3d` and `jsa-live-2d` should auto-pick the Pulse output path without needing
+`--device-index`.
