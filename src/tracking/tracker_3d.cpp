@@ -35,10 +35,12 @@ void Tracker3D::updateFromFrame(const jsa::protocol::SocketFrame3D& frame,
             continue;
         }
 
+        // Socket coords: +x=right, +y=down, +z=forward
+        // Steam Audio:    +x=right, +y=up,   -z=forward
         IPLVector3 position{
             static_cast<float>(object.x),
-            static_cast<float>(object.y),
-            static_cast<float>(object.z)};
+            static_cast<float>(-object.y),
+            static_cast<float>(-object.z)};
 
         auto it = trackedObjects_.find(object.id);
         if (it == trackedObjects_.end()) {
