@@ -46,6 +46,7 @@ add_library(
     src/tracking/tracker_3d.cpp
 )
 target_link_libraries(jsa_tracking PUBLIC unofficial::steam-audio::phonon)
+target_link_libraries(jsa_tracking PRIVATE jsa_core)
 target_include_directories(
     jsa_tracking
     PUBLIC
@@ -107,7 +108,7 @@ jsa_add_executable(
 jsa_add_executable(
     render-visual-stream
     SOURCES src/apps/visual_monitor/main.cpp
-    LINK_LIBS raylib PkgConfig::GLFW3 PkgConfig::ZMQ jsa_protocol
+    LINK_LIBS raylib PkgConfig::GLFW3 PkgConfig::ZMQ jsa_protocol jsa_core
 )
 
 function(configure_binary_names target_name new_output legacy_output)

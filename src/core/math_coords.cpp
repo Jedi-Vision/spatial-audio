@@ -35,6 +35,14 @@ Vec3 normalizedToWorld(float normalizedX,
     return position;
 }
 
+Vec3 socket3DToHeadSpace(const Vec3& socketPosition) {
+    return {
+        socketPosition.x,
+        -socketPosition.y,
+        -socketPosition.z,
+    };
+}
+
 Vec3 widenAudioAzimuthDirection(const Vec3& position,
                                 float azimuthScale,
                                 float maxAzimuthDeg) {

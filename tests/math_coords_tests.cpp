@@ -89,6 +89,27 @@ bool testNearZeroPositionReturnsForward() {
            expect(nearlyEqual(direction.z, -1.0f), "zero z returns forward");
 }
 
+bool testSocket3DRightStaysRight() {
+    const jsa::core::Vec3 position = jsa::core::socket3DToHeadSpace({1.0f, 0.0f, 0.0f});
+    return expect(nearlyEqual(position.x, 1.0f), "socket +x stays head +x") &&
+           expect(nearlyEqual(position.y, 0.0f), "socket +x keeps y level") &&
+           expect(nearlyEqual(position.z, 0.0f), "socket +x keeps z centered");
+}
+
+bool testSocket3DDownBecomesBelow() {
+    const jsa::core::Vec3 position = jsa::core::socket3DToHeadSpace({0.0f, 1.0f, 0.0f});
+    return expect(nearlyEqual(position.x, 0.0f), "socket +y keeps x centered") &&
+           expect(nearlyEqual(position.y, -1.0f), "socket +y becomes head -y") &&
+           expect(nearlyEqual(position.z, 0.0f), "socket +y keeps z centered");
+}
+
+bool testSocket3DForwardBecomesNegativeZ() {
+    const jsa::core::Vec3 position = jsa::core::socket3DToHeadSpace({0.0f, 0.0f, 1.0f});
+    return expect(nearlyEqual(position.x, 0.0f), "socket +z keeps x centered") &&
+           expect(nearlyEqual(position.y, 0.0f), "socket +z keeps y level") &&
+           expect(nearlyEqual(position.z, -1.0f), "socket +z becomes head -z");
+}
+
 } // namespace
 
 int main() {
@@ -98,5 +119,8 @@ int main() {
     ok = testLeftEdgeWidensSymmetrically() && ok;
     ok = testDistanceDoesNotMatter() && ok;
     ok = testNearZeroPositionReturnsForward() && ok;
+    ok = testSocket3DRightStaysRight() && ok;
+    ok = testSocket3DDownBecomesBelow() && ok;
+    ok = testSocket3DForwardBecomesNegativeZ() && ok;
     return ok ? 0 : 1;
 }

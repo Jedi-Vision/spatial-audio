@@ -1,5 +1,7 @@
 #include <jsa/tracking/tracker_3d.hpp>
 
+#include <jsa/core/math_coords.hpp>
+
 #include <algorithm>
 #include <cmath>
 
@@ -35,12 +37,17 @@ void Tracker3D::updateFromFrame(const jsa::protocol::SocketFrame3D& frame,
             continue;
         }
 
-        // Socket coords: +x=right, +y=down, +z=forward
-        // Steam Audio:    +x=right, +y=up,   -z=forward
+        const jsa::core::Vec3 headPosition = jsa::core::socket3DToHeadSpace(
+            jsa::core::Vec3{
+                static_cast<float>(object.x),
+                static_cast<float>(object.y),
+                static_cast<float>(object.z),
+            });
+
         IPLVector3 position{
-            static_cast<float>(object.x),
-            static_cast<float>(-object.y),
-            static_cast<float>(-object.z)};
+            headPosition.x,
+            headPosition.y,
+            headPosition.z};
 
         auto it = trackedObjects_.find(object.id);
         if (it == trackedObjects_.end()) {

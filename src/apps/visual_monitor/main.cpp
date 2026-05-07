@@ -1,6 +1,7 @@
 #include <raylib.h>
 #include <zmq.h>
 
+#include <jsa/core/math_coords.hpp>
 #include <jsa/protocol/frame_parser.hpp>
 
 #include <algorithm>
@@ -76,6 +77,7 @@ struct ObjectState {
     int id = -1;
     int label = -1;
     Vector3 position{};
+    Vector3 socketPosition{};
     double lastSeenSec = 0.0;
     std::deque<TrailPoint> trail;
 };
@@ -503,6 +505,50 @@ Color colorForObjectId(int objectId) {
     return Color{r, g, b, 255};
 }
 
+Vector3 toRaylibVector(const jsa::core::Vec3& value) {
+    return Vector3{value.x, value.y, value.z};
+}
+
+Vector3 socketObjectToHeadPosition(const OrbitObject& object) {
+    return toRaylibVector(jsa::core::socket3DToHeadSpace(jsa::core::Vec3{
+        static_cast<float>(object.x),
+        static_cast<float>(object.y),
+        static_cast<float>(object.z),
+    }));
+}
+
+float vectorDistance(const Vector3& value) {
+    return std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
+}
+
+const char* horizontalDirectionName(const Vector3& position) {
+    const float absX = std::fabs(position.x);
+    const float absZ = std::fabs(position.z);
+    if (absX < 0.15f && absZ < 0.15f) {
+        return "center";
+    }
+    if (absZ >= absX * 1.35f) {
+        return position.z < 0.0f ? "front" : "behind";
+    }
+    if (absX >= absZ * 1.35f) {
+        return position.x < 0.0f ? "left" : "right";
+    }
+    if (position.z < 0.0f) {
+        return position.x < 0.0f ? "front-left" : "front-right";
+    }
+    return position.x < 0.0f ? "behind-left" : "behind-right";
+}
+
+const char* verticalDirectionName(const Vector3& position) {
+    if (position.y > 0.25f) {
+        return "above";
+    }
+    if (position.y < -0.25f) {
+        return "below";
+    }
+    return "level";
+}
+
 void pruneTrail(ObjectState& state, double nowSec, double trailSeconds) {
     while (!state.trail.empty() && (nowSec - state.trail.front().timeSec) > trailSeconds) {
         state.trail.pop_front();
@@ -526,10 +572,11 @@ void upsertObjectsFromFrame(const OrbitFrame& frame,
             ObjectState state;
             state.id = object.id;
             state.label = object.label;
-            state.position = Vector3{
+            state.socketPosition = Vector3{
                 static_cast<float>(object.x),
                 static_cast<float>(object.y),
                 static_cast<float>(object.z)};
+            state.position = socketObjectToHeadPosition(object);
             state.lastSeenSec = nowSec;
             state.trail.push_back(TrailPoint{state.position, nowSec});
             objects.emplace(object.id, std::move(state));
@@ -538,10 +585,11 @@ void upsertObjectsFromFrame(const OrbitFrame& frame,
 
         ObjectState& state = it->second;
         state.label = object.label;
-        state.position = Vector3{
+        state.socketPosition = Vector3{
             static_cast<float>(object.x),
             static_cast<float>(object.y),
             static_cast<float>(object.z)};
+        state.position = socketObjectToHeadPosition(object);
         state.lastSeenSec = nowSec;
         state.trail.push_back(TrailPoint{state.position, nowSec});
         pruneTrail(state, nowSec, trailSeconds);
@@ -567,6 +615,92 @@ void drawAxes(float axisLength) {
     DrawLine3D(Vector3{0.0f, 0.0f, 0.0f}, Vector3{axisLength, 0.0f, 0.0f}, RED);
     DrawLine3D(Vector3{0.0f, 0.0f, 0.0f}, Vector3{0.0f, axisLength, 0.0f}, GREEN);
     DrawLine3D(Vector3{0.0f, 0.0f, 0.0f}, Vector3{0.0f, 0.0f, axisLength}, BLUE);
+    DrawLine3D(Vector3{0.0f, 0.0f, 0.0f}, Vector3{0.0f, 0.0f, -axisLength}, SKYBLUE);
+}
+
+void drawHeadDirectionMarkers() {
+    DrawLine3D(Vector3{0.0f, 0.0f, 0.0f}, Vector3{0.0f, 0.0f, -1.0f}, RAYWHITE);
+    DrawCylinderEx(Vector3{0.0f, 0.0f, -1.0f},
+                   Vector3{0.0f, 0.0f, -1.28f},
+                   0.16f,
+                   0.0f,
+                   16,
+                   RAYWHITE);
+}
+
+void drawWorldLabel(const char* text, const Vector3& position, const Camera3D& camera) {
+    const Vector2 screen = GetWorldToScreen(position, camera);
+    DrawText(text, static_cast<int>(screen.x) + 6, static_cast<int>(screen.y) - 6, 14, LIGHTGRAY);
+}
+
+void drawAxisLabels(const Camera3D& camera) {
+    drawWorldLabel("Right +X", Vector3{2.55f, 0.0f, 0.0f}, camera);
+    drawWorldLabel("Up +Y", Vector3{0.0f, 2.55f, 0.0f}, camera);
+    drawWorldLabel("Behind +Z", Vector3{0.0f, 0.0f, 2.55f}, camera);
+    drawWorldLabel("Forward -Z", Vector3{0.0f, 0.0f, -2.55f}, camera);
+}
+
+void drawRadarPanel(const std::unordered_map<int, ObjectState>& objects,
+                    double nowSec,
+                    int windowWidth,
+                    int windowHeight) {
+    const int size = 190;
+    const int margin = 18;
+    const int left = std::max(10, windowWidth - size - margin);
+    const int top = std::max(250, windowHeight - size - margin);
+    const Vector2 center{
+        static_cast<float>(left + size / 2),
+        static_cast<float>(top + size / 2),
+    };
+    constexpr float metersToPixels = 28.0f;
+
+    DrawRectangle(left, top, size, size, Fade(BLACK, 0.55f));
+    DrawRectangleLines(left, top, size, size, Fade(RAYWHITE, 0.35f));
+    DrawCircleLines(static_cast<int>(center.x), static_cast<int>(center.y), metersToPixels, DARKGRAY);
+    DrawCircleLines(static_cast<int>(center.x),
+                    static_cast<int>(center.y),
+                    metersToPixels * 2.0f,
+                    DARKGRAY);
+    DrawCircleLines(static_cast<int>(center.x),
+                    static_cast<int>(center.y),
+                    metersToPixels * 3.0f,
+                    DARKGRAY);
+    DrawLine(static_cast<int>(center.x),
+             top + 16,
+             static_cast<int>(center.x),
+             top + size - 16,
+             Fade(RAYWHITE, 0.35f));
+    DrawLine(left + 16,
+             static_cast<int>(center.y),
+             left + size - 16,
+             static_cast<int>(center.y),
+             Fade(RAYWHITE, 0.35f));
+    DrawTriangle(Vector2{center.x, center.y - 12.0f},
+                 Vector2{center.x - 7.0f, center.y + 8.0f},
+                 Vector2{center.x + 7.0f, center.y + 8.0f},
+                 RAYWHITE);
+    DrawText("Front", left + size / 2 - 18, top + 4, 12, LIGHTGRAY);
+    DrawText("Behind", left + size / 2 - 22, top + size - 18, 12, LIGHTGRAY);
+    DrawText("Left", left + 8, top + size / 2 - 6, 12, LIGHTGRAY);
+    DrawText("Right", left + size - 42, top + size / 2 - 6, 12, LIGHTGRAY);
+
+    for (const auto& entry : objects) {
+        const ObjectState& state = entry.second;
+        const float fade = computeObjectFade(nowSec - state.lastSeenSec);
+        if (fade <= 0.0f) {
+            continue;
+        }
+
+        const float px = std::clamp(center.x + state.position.x * metersToPixels,
+                                    static_cast<float>(left + 8),
+                                    static_cast<float>(left + size - 8));
+        const float py = std::clamp(center.y + state.position.z * metersToPixels,
+                                    static_cast<float>(top + 8),
+                                    static_cast<float>(top + size - 8));
+        Color color = colorForObjectId(state.id);
+        color.a = static_cast<unsigned char>(std::round(fade * 255.0f));
+        DrawCircleV(Vector2{px, py}, 5.0f, color);
+    }
 }
 
 float clamp01(float value) {
@@ -762,6 +896,7 @@ int main(int argc, char* argv[]) {
         BeginMode3D(camera);
         DrawGrid(40, 1.0f);
         drawAxes(2.5f);
+        drawHeadDirectionMarkers();
         DrawSphere(Vector3{0.0f, 0.0f, 0.0f}, 0.06f, WHITE);
 
         for (const auto& entry : objects) {
@@ -773,6 +908,7 @@ int main(int argc, char* argv[]) {
             }
 
             const Color base = colorForObjectId(state.id);
+            DrawLine3D(Vector3{0.0f, 0.0f, 0.0f}, state.position, Fade(base, 0.4f * fade));
 
             if (state.trail.size() > 1) {
                 for (size_t idx = 1; idx < state.trail.size(); ++idx) {
@@ -796,6 +932,7 @@ int main(int argc, char* argv[]) {
             DrawSphereWires(state.position, 0.15f, 8, 8, Fade(WHITE, 0.2f * fade));
         }
         EndMode3D();
+        drawAxisLabels(camera);
 
         for (const auto& entry : objects) {
             const ObjectState& state = entry.second;
@@ -820,12 +957,11 @@ int main(int argc, char* argv[]) {
             char text[192];
             std::snprintf(text,
                           sizeof(text),
-                          "id:%d label:%d (%.2f, %.2f, %.2f)",
+                          "id:%d %s %s %.1fm",
                           state.id,
-                          state.label,
-                          state.position.x,
-                          state.position.y,
-                          state.position.z);
+                          horizontalDirectionName(state.position),
+                          verticalDirectionName(state.position),
+                          vectorDistance(state.position));
 
             Color textColor = colorForObjectId(state.id);
             textColor.a = static_cast<unsigned char>(std::round(fade * 255.0f));
@@ -835,6 +971,8 @@ int main(int argc, char* argv[]) {
                      14,
                      textColor);
         }
+
+        drawRadarPanel(objects, nowSec, options.width, options.height);
 
         DrawRectangle(10, 10, 760, 220, Fade(BLACK, 0.55f));
         DrawRectangleLines(10, 10, 760, 220, Fade(RAYWHITE, 0.35f));
@@ -911,7 +1049,12 @@ int main(int argc, char* argv[]) {
         DrawText(line5, 20, 127, 16, LIGHTGRAY);
         DrawText(line6, 20, 148, 16, LIGHTGRAY);
         DrawText(line7, 20, 169, 16, LIGHTGRAY);
-        DrawText("Controls: hold RMB/MMB to move camera | R to reset", 20, 191, 14, GRAY);
+        DrawText("Coords: socket +x right, +y down, +z forward -> display +x right, +y up, -z forward",
+                 20,
+                 191,
+                 14,
+                 GRAY);
+        DrawText("Controls: hold RMB/MMB to move camera | R to reset", 20, 209, 14, GRAY);
 
         EndDrawing();
         ++renderFrameCounter;
