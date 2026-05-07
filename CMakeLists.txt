@@ -138,6 +138,10 @@ if(BUILD_TESTING)
     target_link_libraries(resource_locator_tests PRIVATE jsa_core)
     jsa_apply_project_options(resource_locator_tests)
 
+    add_executable(math_coords_tests tests/math_coords_tests.cpp)
+    target_link_libraries(math_coords_tests PRIVATE jsa_core)
+    jsa_apply_project_options(math_coords_tests)
+
     add_test(
         NAME protocol-frame-parser
         COMMAND $<TARGET_FILE:protocol_frame_parser_tests>
@@ -145,6 +149,10 @@ if(BUILD_TESTING)
     add_test(
         NAME resource-locator
         COMMAND $<TARGET_FILE:resource_locator_tests>
+    )
+    add_test(
+        NAME math-coords
+        COMMAND $<TARGET_FILE:math_coords_tests>
     )
 
     function(add_help_smoke_test target_name)

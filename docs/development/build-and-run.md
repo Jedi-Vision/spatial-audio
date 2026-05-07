@@ -51,6 +51,11 @@ Terminal C:
 ./build/jsa-orbit-stream --ipc ipc:///tmp/jv/audio/0.sock --motion-mode wavy
 ```
 
+To test audio azimuth widening with two objects constrained to a 75 degree camera cone:
+```bash
+./build/jsa-orbit-stream --ipc ipc:///tmp/jv/audio/0.sock --motion-mode fov-sweep --fov-deg 75
+```
+
 ## Docker On Jetson
 To route container audio through the host Jetson PulseAudio sink instead of an HDMI-biased
 PortAudio default device, make sure the container runtime provides:

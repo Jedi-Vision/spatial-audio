@@ -3,6 +3,7 @@
 #include <zmq.h>
 
 #include <fmt/format.h>
+#include <jsa/core/math_coords.hpp>
 #include <jsa/core/resource_locator.hpp>
 #include <jsa/core/wav_io.hpp>
 #include <jsa/protocol/frame_parser.hpp>
@@ -45,6 +46,8 @@ constexpr int DEFAULT_STREAM_TIMEOUT_MS = 34;
 constexpr float DEFAULT_STALE_FRAME_DROP_MS = 100.0f;
 constexpr float DEFAULT_MAX_INTERP_WINDOW_MS = 50.0f;
 constexpr float DEFAULT_HOLD_LAST_POSITION_MS = 0.0f;
+constexpr float DEFAULT_AUDIO_AZIMUTH_SCALE = 180.0f / 73.0f;
+constexpr float DEFAULT_AUDIO_AZIMUTH_MAX_DEG = 90.0f;
 constexpr size_t HEAVY_OBJECT_WARNING_THRESHOLD = 64;
 
 constexpr float DEFAULT_FEEDBACK_RATE_HZ = 6.0f;
@@ -174,6 +177,8 @@ struct CLIOptions {
     float staleFrameDropMs = DEFAULT_STALE_FRAME_DROP_MS;
     float maxInterpWindowMs = DEFAULT_MAX_INTERP_WINDOW_MS;
     float holdLastPositionMs = DEFAULT_HOLD_LAST_POSITION_MS;
+    float audioAzimuthScale = DEFAULT_AUDIO_AZIMUTH_SCALE;
+    float audioAzimuthMaxDeg = DEFAULT_AUDIO_AZIMUTH_MAX_DEG;
     AudioSourceMode sourceMode = AudioSourceMode::Tones;
     std::string songAPath = DEFAULT_SONG_A_FILE;
     std::string songBPath = DEFAULT_SONG_B_FILE;
@@ -209,6 +214,8 @@ struct RuntimeAudioConfig {
     float staleFrameDropMs = DEFAULT_STALE_FRAME_DROP_MS;
     float maxInterpWindowMs = DEFAULT_MAX_INTERP_WINDOW_MS;
     float holdLastPositionMs = DEFAULT_HOLD_LAST_POSITION_MS;
+    float audioAzimuthScale = DEFAULT_AUDIO_AZIMUTH_SCALE;
+    float audioAzimuthMaxDeg = DEFAULT_AUDIO_AZIMUTH_MAX_DEG;
     AudioSourceMode sourceMode = AudioSourceMode::Tones;
     std::string songAPath = DEFAULT_SONG_A_FILE;
     std::string songBPath = DEFAULT_SONG_B_FILE;
@@ -384,6 +391,8 @@ void printUsage(const char* executableName) {
     std::cout << "  --stale-frame-drop-ms <ms>  Drop frames older than this staleness budget (default: 100.0)\n";
     std::cout << "  --max-interp-window-ms <ms> Max interpolation window per render tick (default: 50.0)\n";
     std::cout << "  --hold-last-position-ms <ms> Hold object position before fade on missing frames (default: 0.0)\n";
+    std::cout << "  --audio-azimuth-scale <float> Horizontal audio widening scale (default: 2.46575)\n";
+    std::cout << "  --audio-azimuth-max-deg <deg> Max widened audio azimuth in degrees (default: 90.0)\n";
     std::cout << "  --source-mode <tones|songs> Source generator (default: tones)\n";
     std::cout << "  --song-a <wav>              Song A path for songs mode (default: lucky.wav)\n";
     std::cout << "  --song-b <wav>              Song B path for songs mode (default: september.wav)\n";
@@ -732,6 +741,22 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             }
             continue;
         }
+        if (arg == "--audio-azimuth-scale") {
+            const char* value = requireValue("--audio-azimuth-scale");
+            if (value != nullptr && !parseFloatArg(value, options.audioAzimuthScale)) {
+                std::cerr << fmt::format("Invalid --audio-azimuth-scale value: {}\n", value);
+                options.valid = false;
+            }
+            continue;
+        }
+        if (arg == "--audio-azimuth-max-deg") {
+            const char* value = requireValue("--audio-azimuth-max-deg");
+            if (value != nullptr && !parseFloatArg(value, options.audioAzimuthMaxDeg)) {
+                std::cerr << fmt::format("Invalid --audio-azimuth-max-deg value: {}\n", value);
+                options.valid = false;
+            }
+            continue;
+        }
         if (arg == "--source-mode") {
             const char* value = requireValue("--source-mode");
             AudioSourceMode parsedMode = options.sourceMode;
@@ -806,6 +831,14 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
     }
     if (options.holdLastPositionMs < 0.0f) {
         std::cerr << "--hold-last-position-ms must be >= 0\n";
+        options.valid = false;
+    }
+    if (options.audioAzimuthScale <= 0.0f) {
+        std::cerr << "--audio-azimuth-scale must be > 0\n";
+        options.valid = false;
+    }
+    if (options.audioAzimuthMaxDeg <= 0.0f || options.audioAzimuthMaxDeg > 180.0f) {
+        std::cerr << "--audio-azimuth-max-deg must be in (0, 180]\n";
         options.valid = false;
     }
     if (options.sourceMode == AudioSourceMode::Songs) {
@@ -1392,15 +1425,10 @@ bool renderAndFillOutput(const ObjectTracker3D& tracker,
             }
             voice->wasActiveInLatestFrame = activeInLatestFrame;
 
-            const float distance = std::max(
-                0.001f,
-                std::sqrt(object.position.x * object.position.x +
-                          object.position.y * object.position.y +
-                          object.position.z * object.position.z));
-            IPLVector3 direction{
-                object.position.x / distance,
-                object.position.y / distance,
-                object.position.z / distance};
+            const jsa::core::Vec3 widenedDirection = jsa::core::widenAudioAzimuthDirection(
+                {object.position.x, object.position.y, object.position.z},
+                runtimeConfig.audioAzimuthScale,
+                runtimeConfig.audioAzimuthMaxDeg);
 
             zeroBuffer(resources.inputBuffer);
             if (runtimeConfig.sourceMode == AudioSourceMode::Songs) {
@@ -1460,7 +1488,11 @@ bool renderAndFillOutput(const ObjectTracker3D& tracker,
 
             zeroBuffer(resources.outputBuffer);
             IPLBinauralEffectParams binauralParams{};
-            binauralParams.direction = direction;
+            binauralParams.direction = {
+                widenedDirection.x,
+                widenedDirection.y,
+                widenedDirection.z,
+            };
             binauralParams.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
             binauralParams.spatialBlend = 1.0f;
             binauralParams.hrtf = resources.hrtf;
@@ -1798,6 +1830,8 @@ int main(int argc, char* argv[]) {
     runtimeConfig.staleFrameDropMs = options.staleFrameDropMs;
     runtimeConfig.maxInterpWindowMs = options.maxInterpWindowMs;
     runtimeConfig.holdLastPositionMs = options.holdLastPositionMs;
+    runtimeConfig.audioAzimuthScale = options.audioAzimuthScale;
+    runtimeConfig.audioAzimuthMaxDeg = options.audioAzimuthMaxDeg;
     runtimeConfig.sourceMode = options.sourceMode;
     runtimeConfig.songAPath = options.songAPath;
     runtimeConfig.songBPath = options.songBPath;
@@ -1898,7 +1932,7 @@ int main(int argc, char* argv[]) {
 
     if (runtimeConfig.sourceMode == AudioSourceMode::Songs) {
         std::cout << fmt::format(
-            "Song source mode: A={}, B={}, engine sample rate: {} Hz, master gain: {:.2f}, no-frame fade: {:.1f} ms, recv-timeout: {} ms, stale drop: {:.1f} ms, interp max: {:.1f} ms, hold-last: {:.1f} ms\n",
+            "Song source mode: A={}, B={}, engine sample rate: {} Hz, master gain: {:.2f}, no-frame fade: {:.1f} ms, recv-timeout: {} ms, stale drop: {:.1f} ms, interp max: {:.1f} ms, hold-last: {:.1f} ms, audio azimuth scale: {:.5f}, audio azimuth max: {:.1f} deg\n",
             runtimeConfig.songAPath,
             runtimeConfig.songBPath,
             runtimeConfig.sampleRate,
@@ -1907,14 +1941,16 @@ int main(int argc, char* argv[]) {
             runtimeConfig.streamTimeoutMs,
             runtimeConfig.staleFrameDropMs,
             runtimeConfig.maxInterpWindowMs,
-            runtimeConfig.holdLastPositionMs);
+            runtimeConfig.holdLastPositionMs,
+            runtimeConfig.audioAzimuthScale,
+            runtimeConfig.audioAzimuthMaxDeg);
     } else {
         const char* toneScheduleLabel =
             (runtimeConfig.toneScheduleMode == ToneScheduleMode::RoundRobin)
                 ? "round-robin"
                 : "hash";
         std::cout << fmt::format(
-            "Synth source mode: base {:.3f} Hz, engine sample rate: {} Hz, feedback rate: {:.2f} Hz, duty: {:.2f}, tone schedule: {}, tone min gap: {:.1f} ms, master gain: {:.2f}, no-frame fade: {:.1f} ms, recv-timeout: {} ms, stale drop: {:.1f} ms, interp max: {:.1f} ms, hold-last: {:.1f} ms\n",
+            "Synth source mode: base {:.3f} Hz, engine sample rate: {} Hz, feedback rate: {:.2f} Hz, duty: {:.2f}, tone schedule: {}, tone min gap: {:.1f} ms, master gain: {:.2f}, no-frame fade: {:.1f} ms, recv-timeout: {} ms, stale drop: {:.1f} ms, interp max: {:.1f} ms, hold-last: {:.1f} ms, audio azimuth scale: {:.5f}, audio azimuth max: {:.1f} deg\n",
             DEFAULT_TONE_BASE_FREQ_HZ,
             runtimeConfig.sampleRate,
             runtimeConfig.feedbackRateHz,
@@ -1926,7 +1962,9 @@ int main(int argc, char* argv[]) {
             runtimeConfig.streamTimeoutMs,
             runtimeConfig.staleFrameDropMs,
             runtimeConfig.maxInterpWindowMs,
-            runtimeConfig.holdLastPositionMs);
+            runtimeConfig.holdLastPositionMs,
+            runtimeConfig.audioAzimuthScale,
+            runtimeConfig.audioAzimuthMaxDeg);
     }
 
     prepareIpcEndpoint(options.ipcEndpoint);

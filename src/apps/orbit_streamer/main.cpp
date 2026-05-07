@@ -20,11 +20,13 @@ namespace {
 constexpr const char* DEFAULT_IPC_ENDPOINT = "ipc:///tmp/jv/audio/0.sock";
 constexpr double DEFAULT_FPS = 30.0;
 constexpr double DEFAULT_RADIUS_METERS = 2.0;
+constexpr double DEFAULT_FOV_SWEEP_DEPTH_METERS = 1.0;
 constexpr double DEFAULT_PERIOD_SECONDS = 8.0;
 constexpr double DEFAULT_Y_METERS = 0.0;
 constexpr double DEFAULT_RADIAL_AMP_METERS = 0.75;
 constexpr double DEFAULT_RADIAL_PERIOD_SECONDS = 5.0;
 constexpr double DEFAULT_PHASE_OFFSET_DEG = 180.0;
+constexpr double DEFAULT_FOV_DEG = 75.0;
 constexpr double MIN_WAVY_RADIUS_METERS = 0.2;
 constexpr int DEFAULT_ID_1 = 1;
 constexpr int DEFAULT_ID_2 = 2;
@@ -47,9 +49,13 @@ enum class MotionMode {
     Orbit,
     Wavy,
     SingleWavy,
+    FovSweep,
 };
 
 const char* motionModeToString(MotionMode mode) {
+    if (mode == MotionMode::FovSweep) {
+        return "fov-sweep";
+    }
     if (mode == MotionMode::SingleWavy) {
         return "single-wavy";
     }
@@ -76,6 +82,10 @@ bool parseMotionMode(const char* text, MotionMode& out) {
         out = MotionMode::SingleWavy;
         return true;
     }
+    if (value == "fov-sweep" || value == "fov_sweep") {
+        out = MotionMode::FovSweep;
+        return true;
+    }
     return false;
 }
 
@@ -84,11 +94,13 @@ struct CLIOptions {
     std::string assetsRoot;
     double fps = DEFAULT_FPS;
     double radiusMeters = DEFAULT_RADIUS_METERS;
+    bool radiusProvided = false;
     double periodSec = DEFAULT_PERIOD_SECONDS;
     MotionMode motionMode = MotionMode::Orbit;
     double radialAmpMeters = DEFAULT_RADIAL_AMP_METERS;
     double radialPeriodSec = DEFAULT_RADIAL_PERIOD_SECONDS;
     double phaseOffsetDeg = DEFAULT_PHASE_OFFSET_DEG;
+    double fovDeg = DEFAULT_FOV_DEG;
     double yMeters = DEFAULT_Y_METERS;
     int id1 = DEFAULT_ID_1;
     int id2 = DEFAULT_ID_2;
@@ -131,12 +143,13 @@ void printUsage(const char* executableName) {
     std::cout << "  --ipc <endpoint>      ZeroMQ endpoint (default: ipc:///tmp/jv/audio/0.sock)\n";
     std::cout << "  --assets-root <path>  Asset root override (unused by this app)\n";
     std::cout << "  --fps <value>         Frames per second (default: 30.0)\n";
-    std::cout << "  --radius <meters>     Orbit radius in meters (default: 2.0)\n";
+    std::cout << "  --radius <meters>     Orbit radius or fov-sweep depth in meters (default: 2.0; fov-sweep default: 1.0)\n";
     std::cout << "  --period-sec <sec>    Orbit period in seconds (default: 8.0)\n";
-    std::cout << "  --motion-mode <name>  Motion mode: orbit|wavy|single-wavy (default: orbit)\n";
+    std::cout << "  --motion-mode <name>  Motion mode: orbit|wavy|single-wavy|fov-sweep (default: orbit)\n";
     std::cout << "  --radial-amp <meters> Radius modulation amplitude (default: 0.75)\n";
     std::cout << "  --radial-period-sec <sec> Radius modulation period (default: 5.0)\n";
     std::cout << "  --phase-offset-deg <deg>  Object 2 radial phase offset for wavy (default: 180.0)\n";
+    std::cout << "  --fov-deg <deg>       Horizontal FOV cone for fov-sweep (default: 75.0)\n";
     std::cout << "  --y <meters>          Constant Y height (default: 0.0)\n";
     std::cout << "  --id1 <int>           Object 1 ID (default: 1)\n";
     std::cout << "  --id2 <int>           Object 2 ID (default: 2)\n";
@@ -220,6 +233,8 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             if (value != nullptr && !parseDouble(value, options.radiusMeters)) {
                 std::cerr << "Invalid --radius value: " << value << "\n";
                 options.valid = false;
+            } else if (value != nullptr) {
+                options.radiusProvided = true;
             }
             continue;
         }
@@ -236,7 +251,7 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             MotionMode parsedMode = MotionMode::Orbit;
             if (value != nullptr && !parseMotionMode(value, parsedMode)) {
                 std::cerr << "Invalid --motion-mode value: " << value
-                          << " (expected orbit|wavy|single-wavy)\n";
+                          << " (expected orbit|wavy|single-wavy|fov-sweep)\n";
                 options.valid = false;
             } else if (value != nullptr) {
                 options.motionMode = parsedMode;
@@ -263,6 +278,14 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             const char* value = requireValue("--phase-offset-deg");
             if (value != nullptr && !parseDouble(value, options.phaseOffsetDeg)) {
                 std::cerr << "Invalid --phase-offset-deg value: " << value << "\n";
+                options.valid = false;
+            }
+            continue;
+        }
+        if (arg == "--fov-deg") {
+            const char* value = requireValue("--fov-deg");
+            if (value != nullptr && !parseDouble(value, options.fovDeg)) {
+                std::cerr << "Invalid --fov-deg value: " << value << "\n";
                 options.valid = false;
             }
             continue;
@@ -330,6 +353,10 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
     }
     if (options.radialPeriodSec <= 0.0) {
         std::cerr << "--radial-period-sec must be > 0\n";
+        options.valid = false;
+    }
+    if (options.fovDeg <= 0.0 || options.fovDeg >= 180.0) {
+        std::cerr << "--fov-deg must be in (0, 180)\n";
         options.valid = false;
     }
     if ((options.motionMode == MotionMode::Wavy || options.motionMode == MotionMode::SingleWavy) &&
@@ -485,6 +512,20 @@ void printSummary(const Stats& stats) {
     std::cout << "  retries: " << stats.retries << "\n";
 }
 
+OrbitObject makeObjectAtAzimuth(int id,
+                                int label,
+                                double azimuthRad,
+                                double depthMeters,
+                                double yMeters) {
+    OrbitObject object;
+    object.id = id;
+    object.label = label;
+    object.x = depthMeters * std::tan(azimuthRad);
+    object.y = yMeters;
+    object.z = depthMeters;
+    return object;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -501,28 +542,41 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    CLIOptions runtimeOptions = options;
+    if (runtimeOptions.motionMode == MotionMode::FovSweep && !runtimeOptions.radiusProvided) {
+        runtimeOptions.radiusMeters = DEFAULT_FOV_SWEEP_DEPTH_METERS;
+    }
+
     void* context = zmq_ctx_new();
     if (context == nullptr) {
         std::cerr << "Error: failed to create ZeroMQ context\n";
         return 1;
     }
 
-    void* socket = createReqSocket(context, options.ipcEndpoint);
+    void* socket = createReqSocket(context, runtimeOptions.ipcEndpoint);
     if (socket == nullptr) {
         zmq_ctx_term(context);
         return 1;
     }
 
-    std::cout << "Streaming 3D orbit frames to " << options.ipcEndpoint << "\n";
-    std::cout << "motion_mode=" << motionModeToString(options.motionMode)
-              << " fps=" << options.fps
-              << " radius=" << options.radiusMeters
-              << " period=" << options.periodSec
-              << " y=" << options.yMeters << "\n";
-    if (options.motionMode == MotionMode::Wavy || options.motionMode == MotionMode::SingleWavy) {
-        std::cout << "wavy radial_amp=" << options.radialAmpMeters
-                  << " radial_period=" << options.radialPeriodSec
-                  << " phase_offset_deg=" << options.phaseOffsetDeg << "\n";
+    std::cout << "Streaming 3D orbit frames to " << runtimeOptions.ipcEndpoint << "\n";
+    std::cout << "motion_mode=" << motionModeToString(runtimeOptions.motionMode)
+              << " fps=" << runtimeOptions.fps
+              << " radius=" << runtimeOptions.radiusMeters
+              << " period=" << runtimeOptions.periodSec
+              << " y=" << runtimeOptions.yMeters << "\n";
+    if (runtimeOptions.motionMode == MotionMode::Wavy ||
+        runtimeOptions.motionMode == MotionMode::SingleWavy) {
+        std::cout << "wavy radial_amp=" << runtimeOptions.radialAmpMeters
+                  << " radial_period=" << runtimeOptions.radialPeriodSec
+                  << " phase_offset_deg=" << runtimeOptions.phaseOffsetDeg << "\n";
+    } else if (runtimeOptions.motionMode == MotionMode::FovSweep) {
+        const double edgeDistance =
+            runtimeOptions.radiusMeters / std::cos(runtimeOptions.fovDeg * 0.5 * (kPi / 180.0));
+        std::cout << "fov_sweep horizontal_fov_deg=" << runtimeOptions.fovDeg
+                  << " azimuth_range_deg=+/-" << (runtimeOptions.fovDeg * 0.5)
+                  << " socket_z_depth=" << runtimeOptions.radiusMeters
+                  << " edge_distance=" << edgeDistance << "\n";
     }
     if (MALFORMED_FRAME_EVERY_N > 0) {
         std::cout << "Malformed frame injection enabled every "
@@ -530,10 +584,11 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Press Ctrl+C to stop.\n";
 
-    const double omega = (2.0 * kPi) / options.periodSec;
-    const double radialOmega = (2.0 * kPi) / options.radialPeriodSec;
-    const double phaseOffsetRad = options.phaseOffsetDeg * (kPi / 180.0);
-    const std::chrono::duration<double> frameIntervalSeconds(1.0 / options.fps);
+    const double omega = (2.0 * kPi) / runtimeOptions.periodSec;
+    const double radialOmega = (2.0 * kPi) / runtimeOptions.radialPeriodSec;
+    const double phaseOffsetRad = runtimeOptions.phaseOffsetDeg * (kPi / 180.0);
+    const double halfFovRad = runtimeOptions.fovDeg * 0.5 * (kPi / 180.0);
+    const std::chrono::duration<double> frameIntervalSeconds(1.0 / runtimeOptions.fps);
     const std::chrono::steady_clock::duration frameInterval =
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(frameIntervalSeconds);
 
@@ -542,7 +597,7 @@ int main(int argc, char* argv[]) {
     Stats stats;
 
     while (gRunning.load()) {
-        const double t = static_cast<double>(frameNumber) / options.fps;
+        const double t = static_cast<double>(frameNumber) / runtimeOptions.fps;
         const double theta = omega * t;
 
         OrbitFrame frame;
@@ -550,36 +605,54 @@ int main(int argc, char* argv[]) {
         frame.timestamp_ms = t * 1000.0;
         frame.objects.clear();
 
+        double azimuth1Rad = 0.0;
+        double azimuth2Rad = 0.0;
         const double angleClockwise = -theta;
         const double angleCounterClockwise = theta;
-        double radius1 = options.radiusMeters;
-        double radius2 = options.radiusMeters;
-        if (options.motionMode == MotionMode::Wavy ||
-            options.motionMode == MotionMode::SingleWavy) {
+        double radius1 = runtimeOptions.radiusMeters;
+        double radius2 = runtimeOptions.radiusMeters;
+        if (runtimeOptions.motionMode == MotionMode::Wavy ||
+            runtimeOptions.motionMode == MotionMode::SingleWavy) {
             const double radialTheta = radialOmega * t;
-            radius1 = options.radiusMeters + options.radialAmpMeters * std::cos(radialTheta);
-            if (options.motionMode == MotionMode::Wavy) {
-                radius2 = options.radiusMeters +
-                          options.radialAmpMeters * std::cos(radialTheta + phaseOffsetRad);
+            radius1 =
+                runtimeOptions.radiusMeters + runtimeOptions.radialAmpMeters * std::cos(radialTheta);
+            if (runtimeOptions.motionMode == MotionMode::Wavy) {
+                radius2 = runtimeOptions.radiusMeters +
+                          runtimeOptions.radialAmpMeters * std::cos(radialTheta + phaseOffsetRad);
             }
         }
 
-        OrbitObject object1;
-        object1.id = options.id1;
-        object1.label = options.label1;
-        object1.x = radius1 * std::sin(angleClockwise);
-        object1.y = options.yMeters;
-        object1.z = -radius1 * std::cos(angleClockwise);
-        frame.objects.push_back(object1);
+        if (runtimeOptions.motionMode == MotionMode::FovSweep) {
+            azimuth1Rad = halfFovRad * std::sin(theta);
+            azimuth2Rad = halfFovRad * std::sin(theta + kPi);
+            frame.objects.push_back(makeObjectAtAzimuth(runtimeOptions.id1,
+                                                        runtimeOptions.label1,
+                                                        azimuth1Rad,
+                                                        runtimeOptions.radiusMeters,
+                                                        runtimeOptions.yMeters));
+            frame.objects.push_back(makeObjectAtAzimuth(runtimeOptions.id2,
+                                                        runtimeOptions.label2,
+                                                        azimuth2Rad,
+                                                        runtimeOptions.radiusMeters,
+                                                        runtimeOptions.yMeters));
+        } else {
+            OrbitObject object1;
+            object1.id = runtimeOptions.id1;
+            object1.label = runtimeOptions.label1;
+            object1.x = radius1 * std::sin(angleClockwise);
+            object1.y = runtimeOptions.yMeters;
+            object1.z = radius1 * std::cos(angleClockwise);
+            frame.objects.push_back(object1);
 
-        if (options.motionMode != MotionMode::SingleWavy) {
-            OrbitObject object2;
-            object2.id = options.id2;
-            object2.label = options.label2;
-            object2.x = radius2 * std::sin(angleCounterClockwise);
-            object2.y = options.yMeters;
-            object2.z = -radius2 * std::cos(angleCounterClockwise);
-            frame.objects.push_back(object2);
+            if (runtimeOptions.motionMode != MotionMode::SingleWavy) {
+                OrbitObject object2;
+                object2.id = runtimeOptions.id2;
+                object2.label = runtimeOptions.label2;
+                object2.x = radius2 * std::sin(angleCounterClockwise);
+                object2.y = runtimeOptions.yMeters;
+                object2.z = radius2 * std::cos(angleCounterClockwise);
+                frame.objects.push_back(object2);
+            }
         }
 
         std::vector<uint8_t> payload;
@@ -594,7 +667,8 @@ int main(int argc, char* argv[]) {
         maybeInjectMalformedFrame(payload, frameNumber);
 
         ++stats.sent;
-        SendResult result = sendFrameWithSingleRetry(socket, context, options.ipcEndpoint, payload);
+        SendResult result =
+            sendFrameWithSingleRetry(socket, context, runtimeOptions.ipcEndpoint, payload);
         if (result.retried) {
             ++stats.retries;
         }
@@ -631,10 +705,13 @@ int main(int argc, char* argv[]) {
                 std::cout << " obj2=(" << frame.objects[1].x << "," << frame.objects[1].y << ","
                           << frame.objects[1].z << ")";
             }
-            if (options.motionMode == MotionMode::Wavy) {
+            if (runtimeOptions.motionMode == MotionMode::Wavy) {
                 std::cout << " r1=" << radius1 << " r2=" << radius2;
-            } else if (options.motionMode == MotionMode::SingleWavy) {
+            } else if (runtimeOptions.motionMode == MotionMode::SingleWavy) {
                 std::cout << " r1=" << radius1;
+            } else if (runtimeOptions.motionMode == MotionMode::FovSweep) {
+                std::cout << " az1_deg=" << (azimuth1Rad * 180.0 / kPi)
+                          << " az2_deg=" << (azimuth2Rad * 180.0 / kPi);
             }
             std::cout
                       << " stats{ok=" << stats.ackedOk

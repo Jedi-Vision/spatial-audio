@@ -14,4 +14,8 @@ Vec3 normalizedToWorld(float normalizedX,
                        float horizontalFovDeg,
                        float verticalFovDeg);
 
+Vec3 widenAudioAzimuthDirection(const Vec3& position,
+                                float azimuthScale,
+                                float maxAzimuthDeg);
+
 } // namespace jsa::core
