@@ -5,7 +5,6 @@
 #include <fmt/format.h>
 
 #include <jsa/core/resource_locator.hpp>
-#include <jsa/core/wav_io.hpp>
 #include <jsa/protocol/frame_parser.hpp>
 #include <jsa/tracking/tracker_2d.hpp>
 
@@ -45,12 +44,18 @@ constexpr float FADE_OUT_TIME_MS = 100.0f;
 
 constexpr float BEAT_CYCLE_MS = 2000.0f;
 constexpr float BEAT_DURATION_MS = 400.0f;
-constexpr float SOURCE_AUDIO_LIMIT_MS = 300.0f;
 constexpr float BEAT_OFFSET[MAX_SIMULTANEOUS_OBJECTS] = {0.0f, 0.25f, 0.5f, 0.75f};
 constexpr float PITCH_SEMITONES[MAX_SIMULTANEOUS_OBJECTS] = {0.0f, 4.0f, 7.0f, 11.0f};
+constexpr float DEFAULT_TONE_BASE_FREQ_HZ = 523.251130f;
+constexpr float TONE_FUNDAMENTAL_WEIGHT = 0.78f;
+constexpr float TONE_SECOND_HARMONIC_WEIGHT = 0.17f;
+constexpr float TONE_THIRD_HARMONIC_WEIGHT = 0.05f;
+constexpr float TONE_BRIGHTNESS_DECAY_COEFF = 4.0f;
+constexpr float TONE_MAX_NYQUIST_RATIO = 0.45f;
+constexpr float TONE_MIN_FREQUENCY_HZ = 20.0f;
+constexpr float TWO_PI = 6.28318530717958647692f;
 
 constexpr const char* DEFAULT_IPC_ENDPOINT = "ipc:///tmp/jv/audio/0.sock";
-constexpr const char* DEFAULT_AUDIO_FILE = "beep_1.wav";
 constexpr const char* DEFAULT_HRTF_SOFA = "D2_HRIR_SOFA/D2_44K_16bit_256tap_FIR_SOFA.sofa";
 
 const IPLVector3 LISTENER_POSITION = {0.0f, 0.0f, 0.0f};
@@ -63,7 +68,6 @@ void handleSignal(int) {
 
 struct CLIOptions {
     std::string ipcEndpoint = DEFAULT_IPC_ENDPOINT;
-    std::string audioPath = DEFAULT_AUDIO_FILE;
     std::string assetsRoot;
     bool useDefaultHRTF = true;
     int deviceIndex = -1;
@@ -83,15 +87,10 @@ struct OutputDeviceSelection {
     bool pulseDeviceFound = false;
 };
 
-struct WAVFile {
-    uint32_t sampleRate = 0;
-    uint16_t numChannels = 0;
-    uint16_t bitsPerSample = 0;
-    std::vector<float> samples;
-};
 
 struct ObjectAudioParams {
     float pitchRatio = 1.0f;
+    float frequencyHz = DEFAULT_TONE_BASE_FREQ_HZ;
     float beatOffset = 0.0f;
     float beatCycleSec = 0.6f;
     float beatDurationSec = 0.15f;
@@ -102,6 +101,7 @@ struct ObjectAudioParams {
                                     ? PITCH_SEMITONES[slot]
                                     : 0.0f;
         params.pitchRatio = std::pow(2.0f, semitones / 12.0f);
+        params.frequencyHz = DEFAULT_TONE_BASE_FREQ_HZ * params.pitchRatio;
         params.beatOffset = (slot >= 0 && slot < MAX_SIMULTANEOUS_OBJECTS)
                                 ? BEAT_OFFSET[slot]
                                 : 0.0f;
@@ -134,7 +134,6 @@ void printUsage(const char* executableName) {
     std::cout << "Usage: " << executableName << " [OPTIONS]\n";
     std::cout << "Options:\n";
     std::cout << "  --ipc <endpoint>            ZeroMQ endpoint (default: ipc:///tmp/jv/audio/0.sock)\n";
-    std::cout << "  --audio <wav>               Mono source WAV path (default: beep_1.wav)\n";
     std::cout << "  --assets-root <path>        Asset root override (highest priority)\n";
     std::cout << "  --hrtf <default|custom>     HRTF type (default: default)\n";
     std::cout << "  --device-index <index>      PortAudio output device index (default: auto; prefers Pulse when PULSE_SERVER is set)\n";
@@ -153,10 +152,6 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
 
         if (arg == "--ipc" && i + 1 < argc) {
             options.ipcEndpoint = argv[++i];
-            continue;
-        }
-        if (arg == "--audio" && i + 1 < argc) {
-            options.audioPath = argv[++i];
             continue;
         }
         if (arg == "--assets-root" && i + 1 < argc) {
@@ -346,58 +341,46 @@ bool allocateBuffer(IPLContext context,
     return true;
 }
 
-bool readWAV(const std::string& filename, WAVFile& wav) {
-    jsa::core::WavData loaded;
-    std::string err;
-    if (!jsa::core::loadWavFile(filename, loaded, err)) {
-        std::cerr << fmt::format("Error: {}\n", err);
-        return false;
-    }
-
-    wav.sampleRate = static_cast<uint32_t>(loaded.sampleRate);
-    wav.numChannels = static_cast<uint16_t>(loaded.channels);
-    wav.bitsPerSample = static_cast<uint16_t>(loaded.bitsPerSample);
-    wav.samples = std::move(loaded.samples);
-
-    std::cout << fmt::format(
-        "Loaded WAV: {} ({} Hz, {} samples)\n", filename, wav.sampleRate, wav.samples.size());
-    return true;
-}
-
 using ObjectTracker = jsa::tracking::Tracker2D;
 
-void getAudioSamples(const WAVFile& wav,
-                     float* output,
-                     int numSamples,
-                     float startTimeSec,
-                     float targetSampleRate,
-                     float pitchRatio,
-                     float beatOffset,
-                     float beatCycleSec,
-                     float beatDurationSec) {
-    if (wav.samples.empty()) {
+void getToneSamples(float* output,
+                    int numSamples,
+                    float startTimeSec,
+                    float targetSampleRate,
+                    const ObjectAudioParams& params) {
+    if (output == nullptr || numSamples <= 0) {
+        return;
+    }
+
+    if (targetSampleRate <= 0.0f || params.beatCycleSec <= 0.0f || params.beatDurationSec <= 0.0f) {
         std::fill(output, output + numSamples, 0.0f);
         return;
     }
 
-    const float sourceSampleRate = static_cast<float>(wav.sampleRate);
-    const size_t sourceSize = wav.samples.size();
-    const float slotStart = beatOffset * beatCycleSec;
-    const float slotEnd = slotStart + beatDurationSec;
-    const float sourceLimitSamples = (SOURCE_AUDIO_LIMIT_MS / 1000.0f) * sourceSampleRate;
-    const float effectiveSourceSize =
-        std::min(static_cast<float>(sourceSize), sourceLimitSamples);
+    const float safeSampleRate = std::max(1.0f, targetSampleRate);
+    const float slotStart = params.beatOffset * params.beatCycleSec;
+    const float slotEnd = slotStart + params.beatDurationSec;
+    const float maxFrequencyHz =
+        std::max(TONE_MIN_FREQUENCY_HZ, TONE_MAX_NYQUIST_RATIO * safeSampleRate);
+    const float frequencyHz =
+        std::max(TONE_MIN_FREQUENCY_HZ, std::min(params.frequencyHz, maxFrequencyHz));
+    const float attackSec = std::max(1.0f / safeSampleRate, std::min(0.008f, params.beatDurationSec * 0.20f));
+    const float releaseSec =
+        std::max(1.0f / safeSampleRate, std::min(0.030f, params.beatDurationSec * 0.35f));
 
     for (int i = 0; i < numSamples; ++i) {
-        const float targetTime = startTimeSec + (static_cast<float>(i) / targetSampleRate);
-        const float cyclePosition = std::fmod(targetTime, beatCycleSec);
+        const float targetTime = startTimeSec + (static_cast<float>(i) / safeSampleRate);
+        float cyclePosition = std::fmod(targetTime, params.beatCycleSec);
+        if (cyclePosition < 0.0f) {
+            cyclePosition += params.beatCycleSec;
+        }
 
         bool inSlot = false;
-        if (slotEnd <= beatCycleSec) {
+        if (slotEnd <= params.beatCycleSec) {
             inSlot = (cyclePosition >= slotStart && cyclePosition < slotEnd);
         } else {
             inSlot = (cyclePosition >= slotStart ||
-                      cyclePosition < std::fmod(slotEnd, beatCycleSec));
+                      cyclePosition < std::fmod(slotEnd, params.beatCycleSec));
         }
 
         if (!inSlot) {
@@ -407,32 +390,37 @@ void getAudioSamples(const WAVFile& wav,
 
         float timeInSlot = cyclePosition - slotStart;
         if (timeInSlot < 0.0f) {
-            timeInSlot += beatCycleSec;
+            timeInSlot += params.beatCycleSec;
         }
 
-        const float sourceSampleIndex = timeInSlot * sourceSampleRate * pitchRatio;
-        if (sourceSampleIndex >= effectiveSourceSize) {
+        if (timeInSlot < 0.0f || timeInSlot >= params.beatDurationSec) {
             output[i] = 0.0f;
             continue;
         }
 
-        float envelope = 1.0f;
-        const float fadeTime = 0.01f;
-        const float sourceTime = sourceSampleIndex / sourceSampleRate;
-        const float sourceDuration = effectiveSourceSize / sourceSampleRate;
-        if (sourceTime < fadeTime) {
-            envelope = sourceTime / fadeTime;
-        } else if (sourceTime > sourceDuration - fadeTime) {
-            envelope = (sourceDuration - sourceTime) / fadeTime;
+        const float slotProgress =
+            std::max(0.0f, std::min(timeInSlot / params.beatDurationSec, 1.0f));
+        float attackEnvelope = 1.0f;
+        if (timeInSlot < attackSec) {
+            attackEnvelope = timeInSlot / attackSec;
         }
 
-        const size_t index = static_cast<size_t>(sourceSampleIndex);
-        const size_t nextIndex =
-            std::min(index + 1, static_cast<size_t>(effectiveSourceSize) - 1);
-        const float fraction = sourceSampleIndex - std::floor(sourceSampleIndex);
-        const float sample = wav.samples[index] +
-                             (wav.samples[nextIndex] - wav.samples[index]) * fraction;
-        output[i] = sample * envelope;
+        const float timeRemainingInSlot = params.beatDurationSec - timeInSlot;
+        float releaseEnvelope = 1.0f;
+        if (timeRemainingInSlot < releaseSec) {
+            releaseEnvelope = std::max(0.0f, timeRemainingInSlot / releaseSec);
+        }
+
+        const float edgeEnvelope = std::min(attackEnvelope, releaseEnvelope);
+        const float bellEnvelope = std::exp(-TONE_BRIGHTNESS_DECAY_COEFF * slotProgress);
+
+        const float basePhase = TWO_PI * frequencyHz * timeInSlot;
+        const float tone =
+            (TONE_FUNDAMENTAL_WEIGHT * std::sin(basePhase)) +
+            (TONE_SECOND_HARMONIC_WEIGHT * std::sin(2.0f * basePhase)) +
+            (TONE_THIRD_HARMONIC_WEIGHT * std::sin(3.0f * basePhase));
+
+        output[i] = tone * edgeEnvelope * bellEnvelope;
     }
 }
 
@@ -688,7 +676,6 @@ void releaseFadedSlots(const ObjectTracker& tracker,
 bool renderAndPlaySamples(const ObjectTracker& tracker,
                           int samplesToRender,
                           double& audioTimeSec,
-                          const WAVFile& sourceAudio,
                           SteamAudioResources& resources,
                           PaStream* stream,
                           std::unordered_map<int, int>& objectToSlot,
@@ -727,15 +714,11 @@ bool renderAndPlaySamples(const ObjectTracker& tracker,
 
             zeroBuffer(resources.inputBuffer);
             const ObjectAudioParams audioParams = ObjectAudioParams::forSlot(effectSlot);
-            getAudioSamples(sourceAudio,
-                            resources.inputBuffer.data[0],
-                            FRAME_SIZE,
-                            static_cast<float>(audioTimeSec),
-                            SAMPLE_RATE,
-                            audioParams.pitchRatio,
-                            audioParams.beatOffset,
-                            audioParams.beatCycleSec,
-                            audioParams.beatDurationSec);
+            getToneSamples(resources.inputBuffer.data[0],
+                           FRAME_SIZE,
+                           static_cast<float>(audioTimeSec),
+                           SAMPLE_RATE,
+                           audioParams);
 
             const float fadeVolume = tracker.getFadeVolume(objectId);
             for (int i = 0; i < FRAME_SIZE; ++i) {
@@ -838,21 +821,11 @@ int main(int argc, char* argv[]) {
     }
 
     std::string resolveErr;
-    const auto resolvedAudioPath = resourceLocator.resolveAsset(options.audioPath, resolveErr);
-    if (!resolvedAudioPath.has_value()) {
-        std::cerr << fmt::format("Error: {}\n", resolveErr);
-        return 1;
-    }
 
     const std::string customHrtfPath = DEFAULT_HRTF_SOFA;
     const auto resolvedHrtfPath = resourceLocator.resolveAsset(customHrtfPath, resolveErr);
     if (!options.useDefaultHRTF && !resolvedHrtfPath.has_value()) {
         std::cerr << fmt::format("Error: {}\n", resolveErr);
-        return 1;
-    }
-
-    WAVFile sourceAudio;
-    if (!readWAV(*resolvedAudioPath, sourceAudio)) {
         return 1;
     }
 
@@ -974,7 +947,6 @@ int main(int argc, char* argv[]) {
         if (!renderAndPlaySamples(tracker,
                                   renderSamples,
                                   audioTimeSec,
-                                  sourceAudio,
                                   steamAudio,
                                   stream,
                                   objectToSlot,
