@@ -111,6 +111,12 @@ jsa_add_executable(
     LINK_LIBS raylib PkgConfig::GLFW3 PkgConfig::ZMQ jsa_protocol jsa_core
 )
 
+jsa_add_executable(
+    object-simulator
+    SOURCES src/apps/object_simulator/main.cpp
+    LINK_LIBS raylib PkgConfig::GLFW3 PkgConfig::ZMQ jsa_protocol
+)
+
 function(configure_binary_names target_name new_output legacy_output)
     set_target_properties(${target_name} PROPERTIES OUTPUT_NAME "${new_output}")
     add_custom_command(
@@ -123,12 +129,25 @@ function(configure_binary_names target_name new_output legacy_output)
     )
 endfunction()
 
+function(add_binary_alias target_name alias_name)
+    add_custom_command(
+        TARGET ${target_name}
+        POST_BUILD
+        COMMAND
+            ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:${target_name}>
+            $<TARGET_FILE_DIR:${target_name}>/${alias_name}
+    )
+endfunction()
+
 configure_binary_names(spatial-audio-demo jsa-demo spatial-audio-demo)
 configure_binary_names(object-spatial-audio jsa-offline-render object-spatial-audio)
 configure_binary_names(socket-spatial-audio-live jsa-live-2d socket-spatial-audio-live)
 configure_binary_names(spatial_audio_live_new jsa-live-3d spatial_audio_live_new)
 configure_binary_names(socket-orbit-stream-3d jsa-orbit-stream socket-orbit-stream-3d)
 configure_binary_names(render-visual-stream jsa-visual-monitor render-visual-stream)
+configure_binary_names(object-simulator jsa-object-sim object-simulator)
+add_binary_alias(object-simulator jsa-obj-sim)
 
 if(BUILD_TESTING)
     add_executable(protocol_frame_parser_tests tests/protocol_frame_parser_tests.cpp)
@@ -176,10 +195,13 @@ if(BUILD_TESTING)
     add_help_smoke_test(spatial_audio_live_new)
     add_help_smoke_test(socket-orbit-stream-3d)
     add_help_smoke_test(render-visual-stream)
+    add_help_smoke_test(object-simulator)
     add_help_smoke_alias_test(spatial-audio-demo spatial-audio-demo)
     add_help_smoke_alias_test(object-spatial-audio object-spatial-audio)
     add_help_smoke_alias_test(socket-spatial-audio-live socket-spatial-audio-live)
     add_help_smoke_alias_test(spatial_audio_live_new spatial_audio_live_new)
     add_help_smoke_alias_test(socket-orbit-stream-3d socket-orbit-stream-3d)
     add_help_smoke_alias_test(render-visual-stream render-visual-stream)
+    add_help_smoke_alias_test(object-simulator object-simulator)
+    add_help_smoke_alias_test(object-simulator jsa-obj-sim)
 endif()

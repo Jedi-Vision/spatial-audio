@@ -63,6 +63,29 @@ bool testRoundTrip3D() {
     return true;
 }
 
+bool testZeroObject3DFrame() {
+    jsa::protocol::Frame3DV1 input{};
+    input.frame_number = 77;
+    input.timestamp_ms = 2500.0;
+
+    std::vector<uint8_t> payload;
+    std::string err;
+    if (!expect(jsa::protocol::serializeFrame3DV1(input, payload, err),
+                "serialize zero-object 3D frame")) {
+        return false;
+    }
+
+    jsa::protocol::Frame3DV1 parsed{};
+    if (!expect(jsa::protocol::parseFrame3DV1(payload.data(), payload.size(), parsed, err),
+                "parse zero-object 3D frame")) {
+        return false;
+    }
+
+    return expect(parsed.frame_number == input.frame_number, "zero-object frame number matches") &&
+           expect(parsed.timestamp_ms == input.timestamp_ms, "zero-object timestamp matches") &&
+           expect(parsed.objects.empty(), "zero-object frame has no objects");
+}
+
 bool testRoundTrip2D() {
     jsa::protocol::Frame2DV1 input{};
     input.frame_number = 11;
@@ -167,6 +190,7 @@ bool testShortPayload2D() {
 int main() {
     bool ok = true;
     ok = testRoundTrip3D() && ok;
+    ok = testZeroObject3DFrame() && ok;
     ok = testRoundTrip2D() && ok;
     ok = testMalformedMarker3D() && ok;
     ok = testInvalidObjectCount2D() && ok;
