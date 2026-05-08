@@ -1197,7 +1197,7 @@ bool initializeSteamAudioResources(bool useDefaultHRTF,
 
     resources.distanceModel = {};
     resources.distanceModel.type = IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
-    resources.distanceModel.minDistance = 0.0f;
+    resources.distanceModel.minDistance = 0.01f;
     resources.distanceModel.callback = nullptr;
     resources.distanceModel.userData = nullptr;
     resources.distanceModel.dirty = IPL_FALSE;
