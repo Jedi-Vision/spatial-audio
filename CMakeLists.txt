@@ -15,6 +15,7 @@ jsa_find_dependencies()
 add_library(
     jsa_protocol
     STATIC
+    src/protocol/frame_json.cpp
     src/protocol/frame_parser.cpp
     src/protocol/frame_serializer.cpp
 )
@@ -23,6 +24,7 @@ target_include_directories(
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+target_link_libraries(jsa_protocol PUBLIC nlohmann_json::nlohmann_json)
 jsa_apply_project_options(jsa_protocol)
 
 add_library(
@@ -193,6 +195,10 @@ if(BUILD_TESTING)
     add_help_smoke_test(object-spatial-audio)
     add_help_smoke_test(socket-spatial-audio-live)
     add_help_smoke_test(spatial_audio_live_new)
+    set_tests_properties(
+        help-spatial_audio_live_new
+        PROPERTIES PASS_REGULAR_EXPRESSION "--input-file <jsonl>"
+    )
     add_help_smoke_test(socket-orbit-stream-3d)
     add_help_smoke_test(render-visual-stream)
     add_help_smoke_test(object-simulator)

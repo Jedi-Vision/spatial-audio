@@ -1,4 +1,5 @@
 #include <jsa/protocol/frame_parser.hpp>
+#include <jsa/protocol/frame_json.hpp>
 #include <jsa/protocol/frame_serializer.hpp>
 
 #include <cstdint>
@@ -185,6 +186,69 @@ bool testShortPayload2D() {
     return expect(!ok, "2D parser rejects short payload");
 }
 
+bool testValidStrict3DJsonLine() {
+    const std::string line =
+        R"({"frame_number":0,"timestamp_ms":0.0,"objects":[{"id":1,"label":0,"x":0.0,"y":0.5,"z":-1.0}]})";
+    std::string err;
+    jsa::protocol::Frame3DV1 parsed{};
+    if (!expect(jsa::protocol::parseFrame3DJsonLine(line, parsed, err),
+                "strict 3D JSON line parses")) {
+        return false;
+    }
+
+    return expect(parsed.frame_number == 0, "JSON frame number parsed") &&
+           expect(parsed.timestamp_ms == 0.0, "JSON timestamp parsed") &&
+           expect(parsed.objects.size() == 1, "JSON object count parsed") &&
+           expect(parsed.objects[0].id == 1, "JSON object id parsed") &&
+           expect(parsed.objects[0].label == 0, "JSON object label parsed") &&
+           expect(parsed.objects[0].x == 0.0, "JSON object x parsed") &&
+           expect(parsed.objects[0].y == 0.5, "JSON object y parsed") &&
+           expect(parsed.objects[0].z == -1.0, "JSON object z parsed");
+}
+
+bool testJsonLineMissingTimestampFails() {
+    const std::string line = R"({"frame_number":0,"objects":[]})";
+    std::string err;
+    jsa::protocol::Frame3DV1 parsed{};
+    const bool ok = jsa::protocol::parseFrame3DJsonLine(line, parsed, err);
+    return expect(!ok, "JSON parser rejects missing timestamp_ms");
+}
+
+bool testJsonLineMissingObjectLabelFails() {
+    const std::string line =
+        R"({"frame_number":0,"timestamp_ms":0.0,"objects":[{"id":1,"x":0.0,"y":0.0,"z":-1.0}]})";
+    std::string err;
+    jsa::protocol::Frame3DV1 parsed{};
+    const bool ok = jsa::protocol::parseFrame3DJsonLine(line, parsed, err);
+    return expect(!ok, "JSON parser rejects missing object label");
+}
+
+bool testJsonLineMissingObjectZFails() {
+    const std::string line =
+        R"({"frame_number":0,"timestamp_ms":0.0,"objects":[{"id":1,"label":0,"x":0.0,"y":0.0}]})";
+    std::string err;
+    jsa::protocol::Frame3DV1 parsed{};
+    const bool ok = jsa::protocol::parseFrame3DJsonLine(line, parsed, err);
+    return expect(!ok, "JSON parser rejects missing object z");
+}
+
+bool testMalformedJsonLineFails() {
+    const std::string line =
+        R"({"frame_number":0,"timestamp_ms":0.0,"objects":[{"id":1,"label":0,"x":0.0,"y":0.0,"z":-1.0})";
+    std::string err;
+    jsa::protocol::Frame3DV1 parsed{};
+    const bool ok = jsa::protocol::parseFrame3DJsonLine(line, parsed, err);
+    return expect(!ok, "JSON parser rejects malformed JSON");
+}
+
+bool testJsonLineNonArrayObjectsFails() {
+    const std::string line = R"({"frame_number":0,"timestamp_ms":0.0,"objects":{}})";
+    std::string err;
+    jsa::protocol::Frame3DV1 parsed{};
+    const bool ok = jsa::protocol::parseFrame3DJsonLine(line, parsed, err);
+    return expect(!ok, "JSON parser rejects non-array objects");
+}
+
 } // namespace
 
 int main() {
@@ -196,5 +260,11 @@ int main() {
     ok = testInvalidObjectCount2D() && ok;
     ok = testTrailingBytes3D() && ok;
     ok = testShortPayload2D() && ok;
+    ok = testValidStrict3DJsonLine() && ok;
+    ok = testJsonLineMissingTimestampFails() && ok;
+    ok = testJsonLineMissingObjectLabelFails() && ok;
+    ok = testJsonLineMissingObjectZFails() && ok;
+    ok = testMalformedJsonLineFails() && ok;
+    ok = testJsonLineNonArrayObjectsFails() && ok;
     return ok ? 0 : 1;
 }

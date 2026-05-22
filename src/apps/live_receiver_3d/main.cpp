@@ -6,6 +6,7 @@
 #include <jsa/core/math_coords.hpp>
 #include <jsa/core/resource_locator.hpp>
 #include <jsa/core/wav_io.hpp>
+#include <jsa/protocol/frame_json.hpp>
 #include <jsa/protocol/frame_parser.hpp>
 #include <jsa/tracking/tracker_3d.hpp>
 
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -30,6 +32,7 @@
 #include <string_view>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -161,6 +164,7 @@ ObjectNoteAllocator gObjectNoteAllocator;
 
 struct CLIOptions {
     std::string ipcEndpoint = DEFAULT_IPC_ENDPOINT;
+    std::string inputFile;
     std::string assetsRoot;
     bool useDefaultHRTF = true;
     int deviceIndex = -1;
@@ -375,6 +379,7 @@ void printUsage(const char* executableName) {
     std::cout << "Usage: " << executableName << " [OPTIONS]\n";
     std::cout << "Options:\n";
     std::cout << "  --ipc <endpoint>            ZeroMQ endpoint (default: ipc:///tmp/jv/audio/0.sock)\n";
+    std::cout << "  --input-file <jsonl>        Read newline-delimited 3D JSON frames instead of ZeroMQ\n";
     std::cout << "  --assets-root <path>        Asset root override (highest priority)\n";
     std::cout << "  --hrtf <default|custom>     HRTF type (default: default)\n";
     std::cout << "  --device-index <index>      PortAudio output device index (default: auto; prefers Pulse when PULSE_SERVER is set)\n";
@@ -592,6 +597,16 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             const char* value = requireValue("--ipc");
             if (value != nullptr) {
                 options.ipcEndpoint = value;
+            }
+            continue;
+        }
+        if (arg == "--input-file") {
+            const char* value = requireValue("--input-file");
+            if (value != nullptr && value[0] != '\0') {
+                options.inputFile = value;
+            } else if (value != nullptr) {
+                std::cerr << "--input-file must not be empty\n";
+                options.valid = false;
             }
             continue;
         }
@@ -851,7 +866,6 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             options.valid = false;
         }
     }
-
     return options;
 }
 
@@ -1801,6 +1815,340 @@ double sanitizeSourceDeltaMs(double currentTimestampMs,
     return deltaMs;
 }
 
+void logRuntimeStats(const IncomingFrameQueue& incomingFrames,
+                     const AudioRenderState& renderState,
+                     RuntimeDiagnostics& diagnostics,
+                     std::chrono::steady_clock::time_point& lastAudioStatsLog,
+                     uint64_t& lastUnderflowCount) {
+    const double averageStalenessMs =
+        (diagnostics.staleAcceptedFrames > 0)
+            ? (diagnostics.staleSumMs / static_cast<double>(diagnostics.staleAcceptedFrames))
+            : 0.0;
+
+    const auto queueSnapshot = incomingFrames.snapshot();
+    const uint64_t underflowCount =
+        renderState.outputUnderflowCount.load(std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    const double statsPeriodSec =
+        std::chrono::duration_cast<std::chrono::duration<double>>(now - lastAudioStatsLog)
+            .count();
+    const uint64_t underflowDelta = underflowCount - lastUnderflowCount;
+    const double underflowRatePerSec =
+        (statsPeriodSec > 0.0) ? (underflowDelta / statsPeriodSec) : 0.0;
+    lastAudioStatsLog = now;
+    lastUnderflowCount = underflowCount;
+
+    const uint64_t jitterSampleCount =
+        renderState.callbackJitterSampleCount.load(std::memory_order_relaxed);
+    const double jitterAvgMs =
+        (jitterSampleCount > 0)
+            ? ((renderState.callbackJitterAbsSumUs.load(std::memory_order_relaxed) / 1000.0) /
+               static_cast<double>(jitterSampleCount))
+            : 0.0;
+    const double jitterMaxMs =
+        renderState.callbackJitterAbsMaxUs.load(std::memory_order_relaxed) / 1000.0;
+
+    std::cout << fmt::format(
+        "Timing stats: stale_drop={}, timeout_ticks={}, parse_fail_ticks={}, stale_avg={:.1f} ms, stale_max={:.1f} ms, queue{{pending={},pushed={},popped={},overwritten={}}}, audio{{callbacks={},active_objs={},voices={},underflows={} (+{} @ {:.2f}/s), jitter_avg={:.3f} ms, jitter_max={:.3f} ms, queue_miss={}, render_fail={}}}\n",
+        diagnostics.staleDroppedFrames,
+        diagnostics.timeoutNoFrameTicks,
+        diagnostics.parseFailNoFrameTicks,
+        averageStalenessMs,
+        diagnostics.staleMaxMs,
+        queueSnapshot.hasPending ? 1 : 0,
+        queueSnapshot.pushed,
+        queueSnapshot.popped,
+        queueSnapshot.overwritten,
+        renderState.callbackCount.load(std::memory_order_relaxed),
+        renderState.activeObjectCount.load(std::memory_order_relaxed),
+        renderState.activeVoiceCount.load(std::memory_order_relaxed),
+        underflowCount,
+        underflowDelta,
+        underflowRatePerSec,
+        jitterAvgMs,
+        jitterMaxMs,
+        renderState.queueMissCount.load(std::memory_order_relaxed),
+        renderState.callbackRenderFailures.load(std::memory_order_relaxed));
+}
+
+bool runSocketInput(const CLIOptions& options,
+                    const RuntimeAudioConfig& runtimeConfig,
+                    IncomingFrameQueue& incomingFrames,
+                    AudioRenderState& renderState) {
+    prepareIpcEndpoint(options.ipcEndpoint);
+
+    void* zmqContext = zmq_ctx_new();
+    if (zmqContext == nullptr) {
+        std::cerr << "Error: failed to create ZeroMQ context\n";
+        return false;
+    }
+
+    void* socket = zmq_socket(zmqContext, ZMQ_REP);
+    if (socket == nullptr) {
+        std::cerr << "Error: failed to create ZeroMQ REP socket\n";
+        zmq_ctx_term(zmqContext);
+        return false;
+    }
+
+    const int lingerMs = 0;
+    zmq_setsockopt(socket, ZMQ_LINGER, &lingerMs, sizeof(lingerMs));
+    const int receiveTimeoutMs = runtimeConfig.streamTimeoutMs;
+    zmq_setsockopt(socket, ZMQ_RCVTIMEO, &receiveTimeoutMs, sizeof(receiveTimeoutMs));
+
+    if (zmq_bind(socket, options.ipcEndpoint.c_str()) != 0) {
+        std::cerr << fmt::format("Error: failed to bind socket {}: {}\n",
+                                 options.ipcEndpoint,
+                                 zmq_strerror(zmq_errno()));
+        zmq_close(socket);
+        zmq_ctx_term(zmqContext);
+        return false;
+    }
+
+    std::cout << fmt::format("Listening on {}\n", options.ipcEndpoint);
+    std::cout << "Press Ctrl+C to stop.\n";
+
+    uint64_t receivedFrames = 0;
+    bool hasPreviousSourceTimestamp = false;
+    double previousSourceTimestampMs = 0.0;
+    StreamClockState streamClock;
+    RuntimeDiagnostics diagnostics;
+    auto lastAudioStatsLog = std::chrono::steady_clock::now();
+    uint64_t lastUnderflowCount = 0;
+    bool ok = true;
+
+    while (gRunning.load()) {
+        zmq_msg_t message;
+        zmq_msg_init(&message);
+
+        const int recvResult = zmq_msg_recv(&message, socket, 0);
+        const auto eventTime = std::chrono::steady_clock::now();
+        bool frameAccepted = false;
+        int latestFrameNumber = -1;
+        size_t latestObjectCount = 0;
+
+        if (recvResult == -1) {
+            const int errnum = zmq_errno();
+            zmq_msg_close(&message);
+            if (errnum == EAGAIN || errnum == EINTR) {
+                ++diagnostics.timeoutNoFrameTicks;
+            } else {
+                std::cerr << fmt::format("Error: socket receive failed: {}\n", zmq_strerror(errnum));
+                ok = false;
+                break;
+            }
+        } else {
+            const auto* payload = static_cast<const uint8_t*>(zmq_msg_data(&message));
+            const size_t payloadLen = zmq_msg_size(&message);
+
+            SocketFrame3D frameData;
+            std::string parseError;
+            const bool parsed = parseSocketObjectRep3D(payload, payloadLen, frameData, parseError);
+            zmq_msg_close(&message);
+
+            if (!parsed) {
+                if (zmq_send(socket, "1", 1, 0) == -1) {
+                    std::cerr << "Error: failed to send parse failure ack\n";
+                    ok = false;
+                    break;
+                }
+                ++diagnostics.parseFailNoFrameTicks;
+                if (gParseWarningLimiter.shouldLog()) {
+                    std::cerr << fmt::format(
+                        "Parse failure: {} (payload {} bytes)\n", parseError, payloadLen);
+                }
+            } else {
+                if (zmq_send(socket, "0", 1, 0) == -1) {
+                    std::cerr << "Error: failed to send success ack\n";
+                    ok = false;
+                    break;
+                }
+
+                const double backwardResetThresholdMs =
+                    std::max(100.0, static_cast<double>(runtimeConfig.staleFrameDropMs));
+                const bool hasBackwardJump =
+                    streamClock.hasLastAcceptedTimestamp &&
+                    frameData.timestamp_ms + backwardResetThresholdMs <
+                        streamClock.lastAcceptedTimestampMs;
+                if (!streamClock.anchored || hasBackwardJump) {
+                    if (hasBackwardJump && gStaleDropWarningLimiter.shouldLog()) {
+                        std::cerr << fmt::format(
+                            "Info: source timestamp jump detected (prev {:.1f} ms, now {:.1f} ms). Resetting stream clock anchor.\n",
+                            streamClock.lastAcceptedTimestampMs,
+                            frameData.timestamp_ms);
+                    }
+                    streamClock.anchored = true;
+                    streamClock.anchorSourceTimestampMs = frameData.timestamp_ms;
+                    streamClock.anchorArrivalTime = eventTime;
+                }
+
+                double stalenessMs = 0.0;
+                if (streamClock.anchored) {
+                    const double elapsedSinceAnchorMs =
+                        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                            eventTime - streamClock.anchorArrivalTime)
+                            .count();
+                    const double expectedSourceNowMs =
+                        streamClock.anchorSourceTimestampMs + elapsedSinceAnchorMs;
+                    stalenessMs = expectedSourceNowMs - frameData.timestamp_ms;
+                    if (!std::isfinite(stalenessMs)) {
+                        stalenessMs = 0.0;
+                    }
+                }
+
+                if (stalenessMs > static_cast<double>(runtimeConfig.staleFrameDropMs)) {
+                    ++diagnostics.staleDroppedFrames;
+                    if (gStaleDropWarningLimiter.shouldLog()) {
+                        std::cerr << fmt::format(
+                            "Warning: dropping stale frame {} (staleness {:.1f} ms > {:.1f} ms)\n",
+                            frameData.frame_number,
+                            stalenessMs,
+                            runtimeConfig.staleFrameDropMs);
+                    }
+                } else {
+                    const double interpolationHintMs = sanitizeSourceDeltaMs(
+                        frameData.timestamp_ms,
+                        previousSourceTimestampMs,
+                        hasPreviousSourceTimestamp);
+                    previousSourceTimestampMs = frameData.timestamp_ms;
+                    hasPreviousSourceTimestamp = true;
+
+                    const double stalenessForStatsMs = std::max(0.0, stalenessMs);
+                    ++diagnostics.staleAcceptedFrames;
+                    diagnostics.staleSumMs += stalenessForStatsMs;
+                    diagnostics.staleMaxMs = std::max(diagnostics.staleMaxMs, stalenessForStatsMs);
+
+                    streamClock.hasLastAcceptedTimestamp = true;
+                    streamClock.lastAcceptedTimestampMs = frameData.timestamp_ms;
+
+                    latestFrameNumber = frameData.frame_number;
+                    latestObjectCount = frameData.objects.size();
+                    incomingFrames.push(QueuedFrame3D{std::move(frameData), interpolationHintMs});
+                    frameAccepted = true;
+                    ++receivedFrames;
+                }
+            }
+        }
+
+        if (frameAccepted && receivedFrames % 30 == 0) {
+            std::cout << fmt::format(
+                "Processed {} accepted frames (latest frame {}, objects: {}, voices: {}, underflows: {}, stale dropped: {})\n",
+                receivedFrames,
+                latestFrameNumber,
+                latestObjectCount,
+                renderState.activeVoiceCount.load(std::memory_order_relaxed),
+                renderState.outputUnderflowCount.load(std::memory_order_relaxed),
+                diagnostics.staleDroppedFrames);
+        }
+
+        if (gTimingStatsLimiter.shouldLog()) {
+            logRuntimeStats(incomingFrames,
+                            renderState,
+                            diagnostics,
+                            lastAudioStatsLog,
+                            lastUnderflowCount);
+        }
+    }
+
+    zmq_close(socket);
+    zmq_ctx_term(zmqContext);
+    return ok;
+}
+
+bool runFileInput(const CLIOptions& options,
+                  const RuntimeAudioConfig& runtimeConfig,
+                  IncomingFrameQueue& incomingFrames,
+                  AudioRenderState& renderState) {
+    std::ifstream input(options.inputFile);
+    if (!input) {
+        std::cerr << fmt::format("Error: failed to open input file: {}\n", options.inputFile);
+        return false;
+    }
+
+    std::cout << fmt::format("Reading JSONL input from {}\n", options.inputFile);
+    std::cout << "Press Ctrl+C to stop.\n";
+
+    uint64_t receivedFrames = 0;
+    uint64_t lineNumber = 0;
+    bool hasPreviousSourceTimestamp = false;
+    double previousSourceTimestampMs = 0.0;
+    auto playbackTime = std::chrono::steady_clock::now();
+    RuntimeDiagnostics diagnostics;
+    auto lastAudioStatsLog = std::chrono::steady_clock::now();
+    uint64_t lastUnderflowCount = 0;
+
+    std::string line;
+    while (gRunning.load() && std::getline(input, line)) {
+        ++lineNumber;
+
+        SocketFrame3D frameData;
+        std::string parseError;
+        if (!jsa::protocol::parseFrame3DJsonLine(line, frameData, parseError)) {
+            std::cerr << fmt::format(
+                "Error: failed to parse input line {}: {}\n", lineNumber, parseError);
+            ++diagnostics.parseFailNoFrameTicks;
+            return false;
+        }
+
+        const double interpolationHintMs = sanitizeSourceDeltaMs(
+            frameData.timestamp_ms,
+            previousSourceTimestampMs,
+            hasPreviousSourceTimestamp);
+        if (hasPreviousSourceTimestamp) {
+            const double deltaMs = frameData.timestamp_ms - previousSourceTimestampMs;
+            if (std::isfinite(deltaMs) && deltaMs > 0.0) {
+                playbackTime += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double, std::milli>(deltaMs));
+                std::this_thread::sleep_until(playbackTime);
+            } else {
+                playbackTime = std::chrono::steady_clock::now();
+            }
+        }
+        previousSourceTimestampMs = frameData.timestamp_ms;
+        hasPreviousSourceTimestamp = true;
+
+        const int latestFrameNumber = frameData.frame_number;
+        const size_t latestObjectCount = frameData.objects.size();
+        incomingFrames.push(QueuedFrame3D{std::move(frameData), interpolationHintMs});
+        ++receivedFrames;
+        ++diagnostics.staleAcceptedFrames;
+
+        if (receivedFrames % 30 == 0) {
+            std::cout << fmt::format(
+                "Processed {} input frames (latest frame {}, objects: {}, voices: {}, underflows: {})\n",
+                receivedFrames,
+                latestFrameNumber,
+                latestObjectCount,
+                renderState.activeVoiceCount.load(std::memory_order_relaxed),
+                renderState.outputUnderflowCount.load(std::memory_order_relaxed));
+        }
+
+        if (gTimingStatsLimiter.shouldLog()) {
+            logRuntimeStats(incomingFrames,
+                            renderState,
+                            diagnostics,
+                            lastAudioStatsLog,
+                            lastUnderflowCount);
+        }
+    }
+
+    if (input.bad()) {
+        std::cerr << fmt::format("Error: failed while reading input file: {}\n", options.inputFile);
+        return false;
+    }
+
+    if (gRunning.load()) {
+        const auto fadeOutMs = std::chrono::duration<double, std::milli>(
+            std::max(0.0f, runtimeConfig.noFrameFadeMs));
+        std::cout << fmt::format(
+            "Reached EOF after {} frames. Allowing {:.1f} ms fade-out.\n",
+            receivedFrames,
+            runtimeConfig.noFrameFadeMs);
+        std::this_thread::sleep_for(fadeOutMs);
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1967,224 +2315,9 @@ int main(int argc, char* argv[]) {
             runtimeConfig.audioAzimuthMaxDeg);
     }
 
-    prepareIpcEndpoint(options.ipcEndpoint);
-
-    void* zmqContext = zmq_ctx_new();
-    if (zmqContext == nullptr) {
-        std::cerr << "Error: failed to create ZeroMQ context\n";
-        shutdownOutputStream(stream);
-        return 1;
-    }
-
-    void* socket = zmq_socket(zmqContext, ZMQ_REP);
-    if (socket == nullptr) {
-        std::cerr << "Error: failed to create ZeroMQ REP socket\n";
-        zmq_ctx_term(zmqContext);
-        shutdownOutputStream(stream);
-        return 1;
-    }
-
-    const int lingerMs = 0;
-    zmq_setsockopt(socket, ZMQ_LINGER, &lingerMs, sizeof(lingerMs));
-    const int receiveTimeoutMs = runtimeConfig.streamTimeoutMs;
-    zmq_setsockopt(socket, ZMQ_RCVTIMEO, &receiveTimeoutMs, sizeof(receiveTimeoutMs));
-
-    if (zmq_bind(socket, options.ipcEndpoint.c_str()) != 0) {
-        std::cerr << fmt::format("Error: failed to bind socket {}: {}\n",
-                                 options.ipcEndpoint,
-                                 zmq_strerror(zmq_errno()));
-        zmq_close(socket);
-        zmq_ctx_term(zmqContext);
-        shutdownOutputStream(stream);
-        return 1;
-    }
-
-    std::cout << fmt::format("Listening on {}\n", options.ipcEndpoint);
-    std::cout << "Press Ctrl+C to stop.\n";
-
-    uint64_t receivedFrames = 0;
-    bool hasPreviousSourceTimestamp = false;
-    double previousSourceTimestampMs = 0.0;
-    StreamClockState streamClock;
-    RuntimeDiagnostics diagnostics;
-    auto lastAudioStatsLog = std::chrono::steady_clock::now();
-    uint64_t lastUnderflowCount = 0;
-
-    while (gRunning.load()) {
-        zmq_msg_t message;
-        zmq_msg_init(&message);
-
-        const int recvResult = zmq_msg_recv(&message, socket, 0);
-        const auto eventTime = std::chrono::steady_clock::now();
-        bool frameAccepted = false;
-        int latestFrameNumber = -1;
-        size_t latestObjectCount = 0;
-
-        if (recvResult == -1) {
-            const int errnum = zmq_errno();
-            zmq_msg_close(&message);
-            if (errnum == EAGAIN || errnum == EINTR) {
-                ++diagnostics.timeoutNoFrameTicks;
-            } else {
-                std::cerr << fmt::format("Error: socket receive failed: {}\n", zmq_strerror(errnum));
-                break;
-            }
-        } else {
-            const auto* payload = static_cast<const uint8_t*>(zmq_msg_data(&message));
-            const size_t payloadLen = zmq_msg_size(&message);
-
-            SocketFrame3D frameData;
-            std::string parseError;
-            const bool parsed = parseSocketObjectRep3D(payload, payloadLen, frameData, parseError);
-            zmq_msg_close(&message);
-
-            if (!parsed) {
-                if (zmq_send(socket, "1", 1, 0) == -1) {
-                    std::cerr << "Error: failed to send parse failure ack\n";
-                    break;
-                }
-                ++diagnostics.parseFailNoFrameTicks;
-                if (gParseWarningLimiter.shouldLog()) {
-                    std::cerr << fmt::format(
-                        "Parse failure: {} (payload {} bytes)\n", parseError, payloadLen);
-                }
-            } else {
-                if (zmq_send(socket, "0", 1, 0) == -1) {
-                    std::cerr << "Error: failed to send success ack\n";
-                    break;
-                }
-
-                const double backwardResetThresholdMs =
-                    std::max(100.0, static_cast<double>(runtimeConfig.staleFrameDropMs));
-                const bool hasBackwardJump =
-                    streamClock.hasLastAcceptedTimestamp &&
-                    frameData.timestamp_ms + backwardResetThresholdMs <
-                        streamClock.lastAcceptedTimestampMs;
-                if (!streamClock.anchored || hasBackwardJump) {
-                    if (hasBackwardJump && gStaleDropWarningLimiter.shouldLog()) {
-                        std::cerr << fmt::format(
-                            "Info: source timestamp jump detected (prev {:.1f} ms, now {:.1f} ms). Resetting stream clock anchor.\n",
-                            streamClock.lastAcceptedTimestampMs,
-                            frameData.timestamp_ms);
-                    }
-                    streamClock.anchored = true;
-                    streamClock.anchorSourceTimestampMs = frameData.timestamp_ms;
-                    streamClock.anchorArrivalTime = eventTime;
-                }
-
-                double stalenessMs = 0.0;
-                if (streamClock.anchored) {
-                    const double elapsedSinceAnchorMs =
-                        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
-                            eventTime - streamClock.anchorArrivalTime)
-                            .count();
-                    const double expectedSourceNowMs =
-                        streamClock.anchorSourceTimestampMs + elapsedSinceAnchorMs;
-                    stalenessMs = expectedSourceNowMs - frameData.timestamp_ms;
-                    if (!std::isfinite(stalenessMs)) {
-                        stalenessMs = 0.0;
-                    }
-                }
-
-                if (stalenessMs > static_cast<double>(runtimeConfig.staleFrameDropMs)) {
-                    ++diagnostics.staleDroppedFrames;
-                    if (gStaleDropWarningLimiter.shouldLog()) {
-                        std::cerr << fmt::format(
-                            "Warning: dropping stale frame {} (staleness {:.1f} ms > {:.1f} ms)\n",
-                            frameData.frame_number,
-                            stalenessMs,
-                            runtimeConfig.staleFrameDropMs);
-                    }
-                } else {
-                    const double interpolationHintMs = sanitizeSourceDeltaMs(
-                        frameData.timestamp_ms,
-                        previousSourceTimestampMs,
-                        hasPreviousSourceTimestamp);
-                    previousSourceTimestampMs = frameData.timestamp_ms;
-                    hasPreviousSourceTimestamp = true;
-
-                    const double stalenessForStatsMs = std::max(0.0, stalenessMs);
-                    ++diagnostics.staleAcceptedFrames;
-                    diagnostics.staleSumMs += stalenessForStatsMs;
-                    diagnostics.staleMaxMs = std::max(diagnostics.staleMaxMs, stalenessForStatsMs);
-
-                    streamClock.hasLastAcceptedTimestamp = true;
-                    streamClock.lastAcceptedTimestampMs = frameData.timestamp_ms;
-
-                    latestFrameNumber = frameData.frame_number;
-                    latestObjectCount = frameData.objects.size();
-                    incomingFrames.push(QueuedFrame3D{std::move(frameData), interpolationHintMs});
-                    frameAccepted = true;
-                    ++receivedFrames;
-                }
-            }
-        }
-
-        if (frameAccepted && receivedFrames % 30 == 0) {
-            std::cout << fmt::format(
-                "Processed {} accepted frames (latest frame {}, objects: {}, voices: {}, underflows: {}, stale dropped: {})\n",
-                receivedFrames,
-                latestFrameNumber,
-                latestObjectCount,
-                renderState.activeVoiceCount.load(std::memory_order_relaxed),
-                renderState.outputUnderflowCount.load(std::memory_order_relaxed),
-                diagnostics.staleDroppedFrames);
-        }
-
-        if (gTimingStatsLimiter.shouldLog()) {
-            const double averageStalenessMs =
-                (diagnostics.staleAcceptedFrames > 0)
-                    ? (diagnostics.staleSumMs /
-                       static_cast<double>(diagnostics.staleAcceptedFrames))
-                    : 0.0;
-
-            const auto queueSnapshot = incomingFrames.snapshot();
-            const uint64_t underflowCount =
-                renderState.outputUnderflowCount.load(std::memory_order_relaxed);
-            const auto now = std::chrono::steady_clock::now();
-            const double statsPeriodSec =
-                std::chrono::duration_cast<std::chrono::duration<double>>(now - lastAudioStatsLog)
-                    .count();
-            const uint64_t underflowDelta = underflowCount - lastUnderflowCount;
-            const double underflowRatePerSec =
-                (statsPeriodSec > 0.0) ? (underflowDelta / statsPeriodSec) : 0.0;
-            lastAudioStatsLog = now;
-            lastUnderflowCount = underflowCount;
-
-            const uint64_t jitterSampleCount =
-                renderState.callbackJitterSampleCount.load(std::memory_order_relaxed);
-            const double jitterAvgMs =
-                (jitterSampleCount > 0)
-                    ? ((renderState.callbackJitterAbsSumUs.load(std::memory_order_relaxed) /
-                        1000.0) /
-                       static_cast<double>(jitterSampleCount))
-                    : 0.0;
-            const double jitterMaxMs =
-                renderState.callbackJitterAbsMaxUs.load(std::memory_order_relaxed) / 1000.0;
-
-            std::cout << fmt::format(
-                "Timing stats: stale_drop={}, timeout_ticks={}, parse_fail_ticks={}, stale_avg={:.1f} ms, stale_max={:.1f} ms, queue{{pending={},pushed={},popped={},overwritten={}}}, audio{{callbacks={},active_objs={},voices={},underflows={} (+{} @ {:.2f}/s), jitter_avg={:.3f} ms, jitter_max={:.3f} ms, queue_miss={}, render_fail={}}}\n",
-                diagnostics.staleDroppedFrames,
-                diagnostics.timeoutNoFrameTicks,
-                diagnostics.parseFailNoFrameTicks,
-                averageStalenessMs,
-                diagnostics.staleMaxMs,
-                queueSnapshot.hasPending ? 1 : 0,
-                queueSnapshot.pushed,
-                queueSnapshot.popped,
-                queueSnapshot.overwritten,
-                renderState.callbackCount.load(std::memory_order_relaxed),
-                renderState.activeObjectCount.load(std::memory_order_relaxed),
-                renderState.activeVoiceCount.load(std::memory_order_relaxed),
-                underflowCount,
-                underflowDelta,
-                underflowRatePerSec,
-                jitterAvgMs,
-                jitterMaxMs,
-                renderState.queueMissCount.load(std::memory_order_relaxed),
-                renderState.callbackRenderFailures.load(std::memory_order_relaxed));
-        }
-    }
+    const bool inputOk = options.inputFile.empty()
+                             ? runSocketInput(options, runtimeConfig, incomingFrames, renderState)
+                             : runFileInput(options, runtimeConfig, incomingFrames, renderState);
 
     gRunning.store(false);
     std::cout << "Shutting down...\n";
@@ -2199,8 +2332,6 @@ int main(int argc, char* argv[]) {
     }
     renderState.voices.clear();
 
-    zmq_close(socket);
-    zmq_ctx_term(zmqContext);
     steamAudio.release();
-    return 0;
+    return inputOk ? 0 : 1;
 }
