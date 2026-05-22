@@ -182,6 +182,7 @@ struct CLIOptions {
     AudioSourceMode sourceMode = AudioSourceMode::Tones;
     std::string songAPath = DEFAULT_SONG_A_FILE;
     std::string songBPath = DEFAULT_SONG_B_FILE;
+    std::string outputFilePath;
     bool showHelp = false;
     bool valid = true;
 };
@@ -371,6 +372,48 @@ private:
     uint64_t overwritten_ = 0;
 };
 
+class RenderedAudioQueue {
+public:
+    void push(const float* interleavedSamples, uint64_t frameCount, int channels) {
+        if (interleavedSamples == nullptr || frameCount == 0 || channels <= 0) {
+            return;
+        }
+
+        const uint64_t sampleCount = frameCount * static_cast<uint64_t>(channels);
+        if (sampleCount > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            droppedFrames_.fetch_add(frameCount, std::memory_order_relaxed);
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        const size_t oldSize = samples_.size();
+        samples_.resize(oldSize + static_cast<size_t>(sampleCount));
+        std::copy(interleavedSamples,
+                  interleavedSamples + static_cast<size_t>(sampleCount),
+                  samples_.begin() + oldSize);
+        queuedFrames_ += frameCount;
+    }
+
+    std::vector<float> take(uint64_t& frameCount) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<float> out;
+        out.swap(samples_);
+        frameCount = queuedFrames_;
+        queuedFrames_ = 0;
+        return out;
+    }
+
+    uint64_t droppedFrames() const {
+        return droppedFrames_.load(std::memory_order_relaxed);
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<float> samples_;
+    uint64_t queuedFrames_ = 0;
+    std::atomic<uint64_t> droppedFrames_{0};
+};
+
 void printUsage(const char* executableName) {
     std::cout << "Usage: " << executableName << " [OPTIONS]\n";
     std::cout << "Options:\n";
@@ -396,6 +439,7 @@ void printUsage(const char* executableName) {
     std::cout << "  --source-mode <tones|songs> Source generator (default: tones)\n";
     std::cout << "  --song-a <wav>              Song A path for songs mode (default: lucky.wav)\n";
     std::cout << "  --song-b <wav>              Song B path for songs mode (default: september.wav)\n";
+    std::cout << "  --output-file <wav>         Record final stereo output to a 16-bit PCM WAV file\n";
     std::cout << "  --help, -h                  Show this help message\n";
 }
 
@@ -781,6 +825,16 @@ CLIOptions parseCommandLine(int argc, char* argv[]) {
             const char* value = requireValue("--song-b");
             if (value != nullptr) {
                 options.songBPath = value;
+            }
+            continue;
+        }
+        if (arg == "--output-file") {
+            const char* value = requireValue("--output-file");
+            if (value == nullptr || value[0] == '\0') {
+                std::cerr << "--output-file must not be empty\n";
+                options.valid = false;
+            } else {
+                options.outputFilePath = value;
             }
             continue;
         }
@@ -1324,6 +1378,7 @@ struct AudioRenderState {
     const SongBank* songBank = nullptr;
     SteamAudioResources* resources = nullptr;
     IncomingFrameQueue* incomingFrames = nullptr;
+    RenderedAudioQueue* recordingQueue = nullptr;
     std::optional<ObjectTracker3D> tracker;
     std::unordered_map<int, SourceVoiceState> voices;
     uint64_t renderTimelineUs = 0;
@@ -1354,6 +1409,16 @@ void updateAtomicMax(std::atomic<uint64_t>& target, uint64_t candidate) {
                                          std::memory_order_relaxed,
                                          std::memory_order_relaxed)) {
     }
+}
+
+void enqueueRenderedAudio(AudioRenderState* state,
+                          const float* outputInterleaved,
+                          unsigned long frameCount) {
+    if (state == nullptr || state->recordingQueue == nullptr ||
+        outputInterleaved == nullptr || frameCount == 0) {
+        return;
+    }
+    state->recordingQueue->push(outputInterleaved, static_cast<uint64_t>(frameCount), 2);
 }
 
 bool renderAndFillOutput(const ObjectTracker3D& tracker,
@@ -1577,6 +1642,7 @@ int portAudioCallback(const void* input,
     state->hasLastCallbackAt = true;
 
     if (state->resources == nullptr || state->incomingFrames == nullptr || !state->tracker.has_value()) {
+        enqueueRenderedAudio(state, outputInterleaved, frameCount);
         return paContinue;
     }
 
@@ -1634,6 +1700,7 @@ int portAudioCallback(const void* input,
 
     state->activeObjectCount.store(activeObjects, std::memory_order_relaxed);
     state->activeVoiceCount.store(state->voices.size(), std::memory_order_relaxed);
+    enqueueRenderedAudio(state, outputInterleaved, frameCount);
     return paContinue;
 }
 
@@ -1801,6 +1868,20 @@ double sanitizeSourceDeltaMs(double currentTimestampMs,
     return deltaMs;
 }
 
+bool flushRecordingQueue(RenderedAudioQueue& queue, jsa::core::StreamingWavWriter& writer) {
+    uint64_t frameCount = 0;
+    std::vector<float> samples = queue.take(frameCount);
+    if (frameCount == 0) {
+        return true;
+    }
+    if (!writer.writeInterleavedFloat32(samples.data(), frameCount)) {
+        std::cerr << fmt::format("Error: failed to write recording WAV data: {}\n",
+                                 writer.lastError());
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1876,6 +1957,7 @@ int main(int argc, char* argv[]) {
     }
 
     IncomingFrameQueue incomingFrames;
+    RenderedAudioQueue recordingQueue;
     AudioRenderState renderState;
     renderState.incomingFrames = &incomingFrames;
 
@@ -1905,8 +1987,46 @@ int main(int argc, char* argv[]) {
     renderState.resources = &steamAudio;
     renderState.songBank = activeSongBank;
 
+    jsa::core::StreamingWavWriter recordingWriter;
+    const bool recordingEnabled = !options.outputFilePath.empty();
+    if (recordingEnabled) {
+        if (!recordingWriter.open(options.outputFilePath, runtimeConfig.sampleRate, 2)) {
+            std::cerr << fmt::format("Error: failed to open recording WAV: {}\n",
+                                     recordingWriter.lastError());
+            shutdownOutputStream(stream);
+            steamAudio.release();
+            return 1;
+        }
+        renderState.recordingQueue = &recordingQueue;
+        std::cout << fmt::format("Recording audio output to {}\n", options.outputFilePath);
+    }
+
+    auto finalizeRecording = [&]() -> bool {
+        if (!recordingEnabled) {
+            return true;
+        }
+        bool ok = flushRecordingQueue(recordingQueue, recordingWriter);
+        const uint64_t recordedFrames = recordingWriter.framesWritten();
+        const uint64_t recordedSamples = recordedFrames * 2u;
+        if (!recordingWriter.close()) {
+            std::cerr << fmt::format("Error: failed to finalize recording WAV: {}\n",
+                                     recordingWriter.lastError());
+            ok = false;
+        }
+        std::cout << fmt::format("Recording complete: {} frames, {} samples",
+                                 recordedFrames,
+                                 recordedSamples);
+        const uint64_t droppedFrames = recordingQueue.droppedFrames();
+        if (droppedFrames > 0) {
+            std::cout << fmt::format(" ({} frames dropped from recorder queue)", droppedFrames);
+        }
+        std::cout << "\n";
+        return ok;
+    };
+
     if (!startOutputStream(stream)) {
         shutdownOutputStream(stream);
+        finalizeRecording();
         steamAudio.release();
         return 1;
     }
@@ -1973,6 +2093,7 @@ int main(int argc, char* argv[]) {
     if (zmqContext == nullptr) {
         std::cerr << "Error: failed to create ZeroMQ context\n";
         shutdownOutputStream(stream);
+        finalizeRecording();
         return 1;
     }
 
@@ -1981,6 +2102,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: failed to create ZeroMQ REP socket\n";
         zmq_ctx_term(zmqContext);
         shutdownOutputStream(stream);
+        finalizeRecording();
         return 1;
     }
 
@@ -1996,6 +2118,7 @@ int main(int argc, char* argv[]) {
         zmq_close(socket);
         zmq_ctx_term(zmqContext);
         shutdownOutputStream(stream);
+        finalizeRecording();
         return 1;
     }
 
@@ -2184,6 +2307,10 @@ int main(int argc, char* argv[]) {
                 renderState.queueMissCount.load(std::memory_order_relaxed),
                 renderState.callbackRenderFailures.load(std::memory_order_relaxed));
         }
+
+        if (recordingEnabled && !flushRecordingQueue(recordingQueue, recordingWriter)) {
+            break;
+        }
     }
 
     gRunning.store(false);
@@ -2193,6 +2320,7 @@ int main(int argc, char* argv[]) {
         renderState.outputUnderflowCount.load(std::memory_order_relaxed));
 
     shutdownOutputStream(stream);
+    finalizeRecording();
 
     for (auto& entry : renderState.voices) {
         releaseVoice(entry.second);
