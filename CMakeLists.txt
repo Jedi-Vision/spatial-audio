@@ -162,6 +162,10 @@ if(BUILD_TESTING)
     target_link_libraries(math_coords_tests PRIVATE jsa_core)
     jsa_apply_project_options(math_coords_tests)
 
+    add_executable(wav_io_tests tests/wav_io_tests.cpp)
+    target_link_libraries(wav_io_tests PRIVATE jsa_core)
+    jsa_apply_project_options(wav_io_tests)
+
     add_test(
         NAME protocol-frame-parser
         COMMAND $<TARGET_FILE:protocol_frame_parser_tests>
@@ -173,6 +177,10 @@ if(BUILD_TESTING)
     add_test(
         NAME math-coords
         COMMAND $<TARGET_FILE:math_coords_tests>
+    )
+    add_test(
+        NAME wav-io
+        COMMAND $<TARGET_FILE:wav_io_tests>
     )
 
     function(add_help_smoke_test target_name)
